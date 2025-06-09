@@ -50,10 +50,19 @@ find_package(gflags CONFIG REQUIRED)
 find_package(glog CONFIG REQUIRED)
 find_package(Z3 4.8 CONFIG REQUIRED)
 find_package(doctest CONFIG REQUIRED)
+
+# Find LLVM and Clang from vcpkg
 find_package(LLVM CONFIG REQUIRED)
 llvm_map_components_to_libnames(llvm_libs support core irreader bitreader bitwriter)
+
 find_package(Clang CONFIG REQUIRED)
 
+message(STATUS "LLVM include dirs: ${LLVM_INCLUDE_DIRS}")
+message(STATUS "Clang include dirs: ${CLANG_INCLUDE_DIRS}")
+
+# Add LLVM and Clang include directories
+include_directories(${LLVM_INCLUDE_DIRS})
+include_directories(${CLANG_INCLUDE_DIRS})
 
 #
 # helper macro to set target properties

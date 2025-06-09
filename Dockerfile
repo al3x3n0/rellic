@@ -12,10 +12,16 @@ FROM ${BUILD_BASE} as base
 # Build-time dependencies go here
 # See here for full list of those dependencies
 # https://github.com/lifting-bits/cxx-common/blob/master/docker/Dockerfile.ubuntu.vcpkg
-FROM ghcr.io/lifting-bits/cxx-common/vcpkg-builder-ubuntu-v2:${UBUNTU_VERSION} as deps
+FROM ghcr.io/lifting-bits/cxx-common/vcpkg-builder-ubuntu-v2:${UBUNTU_VERSION} AS deps
 ARG UBUNTU_VERSION
 ARG LLVM_VERSION
 ARG LIBRARIES
+
+# Copy and extract vcpkg files to the correct location
+COPY vcpkg_ubuntu-22.04_llvm-16_arm64.tar.xz /lifting-bits-downloads/
+WORKDIR /lifting-bits-downloads
+RUN tar xf vcpkg_ubuntu-22.04_llvm-16_arm64.tar.xz && \
+    rm vcpkg_ubuntu-22.04_llvm-16_arm64.tar.xz
 
 RUN apt-get update && \
     apt-get install -qqy python3 python3-pip libc6-dev wget liblzma-dev zlib1g-dev curl git build-essential ninja-build libselinux1-dev libbsd-dev ccache pixz xz-utils make rpm && \

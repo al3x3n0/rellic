@@ -20,6 +20,16 @@
 
 namespace rellic {
 
+// Expression position info struct
+struct ExpressionInfo {
+  std::string type;  // Expression type (e.g. "Binary Add", "Unary Minus")
+  std::string llvm_ir;  // LLVM IR instruction that generated this expression
+  unsigned start_line;
+  unsigned start_col;
+  unsigned end_line;
+  unsigned end_col;
+};
+
 /* This additional level of indirection is needed to alleviate the users from
  * the burden of having to instantiate custom TypeProviders before the actual
  * DecompilationContext has been created */
@@ -63,6 +73,8 @@ struct DecompilationResult {
   using IRToTypeDeclMap =
       std::unordered_map<const llvm::Type*, const clang::TypeDecl*>;
   using UseToExprMap = std::unordered_map<const llvm::Use*, const clang::Expr*>;
+  using BBToLineMap = std::unordered_map<std::string, unsigned>;
+  using ExprPositionsMap = std::unordered_map<std::string, ExpressionInfo>;
 
   std::unique_ptr<llvm::Module> module;
   std::unique_ptr<clang::ASTUnit> ast;
@@ -74,6 +86,8 @@ struct DecompilationResult {
   IRToTypeDeclMap type_to_decl_map;
   ExprToUseMap expr_use_map;
   UseToExprMap use_expr_map;
+  BBToLineMap bb_to_line_map;
+  ExprPositionsMap expr_positions;
 };
 
 struct DecompilationError {

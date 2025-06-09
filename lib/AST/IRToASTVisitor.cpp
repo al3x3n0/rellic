@@ -25,6 +25,60 @@
 #include "rellic/Exception.h"
 
 namespace rellic {
+
+// Helper function to get instruction position info
+static std::string GetInstructionPosition(llvm::Value *val) {
+  if (!val) return "";
+  if (auto inst = llvm::dyn_cast<llvm::Instruction>(val)) {
+    auto bb = inst->getParent();
+    auto func = bb->getParent();
+    // Get instruction index in the block
+    unsigned inst_idx = 0;
+    for (auto &I : *bb) {
+      if (&I == inst) break;
+      inst_idx++;
+    }
+    return func->getName().str() + ":" + bb->getName().str() + ":" + std::to_string(inst_idx);
+  }
+  return "";
+}
+
+// Helper function to track expression positions
+void TrackExpressionPosition(DecompilationContext &dec_ctx, clang::Expr *expr, const std::string &type) {
+  auto id = dec_ctx.GenerateExpressionId(expr);
+  DecompilationContext::ExpressionInfo info;
+  info.type = type;
+  
+  // Try to get instruction position from stmt_provenance first
+  if (auto stmt_it = dec_ctx.stmt_provenance.find(expr); stmt_it != dec_ctx.stmt_provenance.end()) {
+    info.llvm_ir = GetInstructionPosition(stmt_it->second);
+    DLOG(INFO) << "Got instruction position from stmt_provenance: " << info.llvm_ir;
+  }
+  // If not found in stmt_provenance, try use_provenance
+  else if (auto use_it = dec_ctx.use_provenance.find(expr); use_it != dec_ctx.use_provenance.end()) {
+    info.llvm_ir = GetInstructionPosition(use_it->second->get());
+    DLOG(INFO) << "Got instruction position from use_provenance: " << info.llvm_ir;
+  }
+  
+  auto &sm = dec_ctx.ast_ctx.getSourceManager();
+  auto start_loc = expr->getBeginLoc();
+  auto end_loc = expr->getEndLoc();
+  
+  if (start_loc.isValid() && end_loc.isValid()) {
+    info.start_line = sm.getSpellingLineNumber(start_loc);
+    info.start_col = sm.getSpellingColumnNumber(start_loc);
+    info.end_line = sm.getSpellingLineNumber(end_loc);
+    info.end_col = sm.getSpellingColumnNumber(end_loc);
+  } else {
+    // If location info is not available, use current line
+    info.start_line = info.end_line = dec_ctx.current_line;
+    info.start_col = info.end_col = 1;
+  }
+  
+  dec_ctx.expr_positions[id] = info;
+  DLOG(INFO) << "Tracked expression " << id << " with type " << type << " and instruction position: " << info.llvm_ir;
+}
+
 class ExprGen : public llvm::InstVisitor<ExprGen, clang::Expr *> {
  private:
   DecompilationContext &dec_ctx;
@@ -394,6 +448,47 @@ clang::Expr *ExprGen::CreateOperandExpr(llvm::Use &val) {
                << "Bitcode: [" << LLVMThingToString(val) << "]\n"
                << "Type: [" << LLVMThingToString(val->getType()) << "]\n";
   }
+
+  // Track expression position if we have a valid result
+  if (res) {
+    auto &sm = dec_ctx.ast_ctx.getSourceManager();
+    auto start_loc = res->getBeginLoc();
+    auto end_loc = res->getEndLoc();
+    
+    // Get the expansion location if this is a macro
+    if (start_loc.isMacroID()) {
+      start_loc = sm.getExpansionLoc(start_loc);
+    }
+    if (end_loc.isMacroID()) {
+      end_loc = sm.getExpansionLoc(end_loc);
+    }
+    
+    if (start_loc.isValid() && end_loc.isValid()) {
+      DecompilationContext::ExpressionInfo info;
+      info.start_line = sm.getSpellingLineNumber(start_loc);
+      info.start_col = sm.getSpellingColumnNumber(start_loc);
+      info.end_line = sm.getSpellingLineNumber(end_loc);
+      info.end_col = sm.getSpellingColumnNumber(end_loc);
+      
+      // Get expression type
+      if (auto binary = llvm::dyn_cast<clang::BinaryOperator>(res)) {
+        info.type = std::string("Binary ") + binary->getOpcodeStr().str();
+      } else if (auto unary = llvm::dyn_cast<clang::UnaryOperator>(res)) {
+        info.type = std::string("Unary ") + unary->getOpcodeStr(unary->getOpcode()).str();
+      } else if (llvm::isa<clang::DeclRefExpr>(res)) {
+        info.type = "Variable Reference";
+      } else if (llvm::isa<clang::CallExpr>(res)) {
+        info.type = "Function Call";
+      } else {
+        info.type = res->getStmtClassName();
+      }
+      
+      std::string expr_id = dec_ctx.GenerateExpressionId(res);
+      dec_ctx.expr_positions[expr_id] = info;
+      DLOG(INFO) << "Tracked expression " << expr_id << " at lines " << info.start_line << "-" << info.end_line;
+    }
+  }
+
   dec_ctx.use_provenance[res] = &val;
   return res;
 }
@@ -512,6 +607,22 @@ clang::Expr *ExprGen::visitCallInst(llvm::CallInst &inst) {
     callexpr = ast.CreateCall(cast, args);
   } else {
     LOG(FATAL) << "Callee is not a function";
+  }
+
+  // Track the call expression position and details
+  if (callexpr) {
+    std::string callee_name;
+    if (auto func = llvm::dyn_cast<llvm::Function>(callee)) {
+      callee_name = func->getName().str();
+    } else if (auto iasm = llvm::dyn_cast<llvm::InlineAsm>(callee)) {
+      callee_name = "inline_asm";
+    } else {
+      callee_name = "function_pointer";
+    }
+    
+    dec_ctx.stmt_provenance[callexpr] = &inst;
+    dec_ctx.use_provenance[callexpr] = &inst.getOperandUse(0);
+    TrackExpressionPosition(dec_ctx, callexpr, "Function Call to " + callee_name);
   }
 
   return callexpr;
@@ -685,68 +796,140 @@ clang::Expr *ExprGen::visitBinaryOperator(llvm::BinaryOperator &inst) {
   switch (inst.getOpcode()) {
     case llvm::BinaryOperator::LShr:
       res = ast.CreateShr(IntSignCast(lhs, false), rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary LShr");
       break;
 
     case llvm::BinaryOperator::AShr:
       res = ast.CreateShr(IntSignCast(lhs, true), rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary AShr");
       break;
 
     case llvm::BinaryOperator::Shl:
       res = ast.CreateShl(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary Shl");
       break;
 
     case llvm::BinaryOperator::And:
-      res = inst.getType()->isIntegerTy(1U) ? ast.CreateLAnd(lhs, rhs)
-                                            : ast.CreateAnd(lhs, rhs);
+      if (inst.getType()->isIntegerTy(1U)) {
+        res = ast.CreateLAnd(lhs, rhs);
+        dec_ctx.stmt_provenance[res] = &inst;
+        dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+        TrackExpressionPosition(dec_ctx, res, "Binary LAnd");
+      } else {
+        res = ast.CreateAnd(lhs, rhs);
+        dec_ctx.stmt_provenance[res] = &inst;
+        dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+        TrackExpressionPosition(dec_ctx, res, "Binary And");
+      }
       break;
 
     case llvm::BinaryOperator::Or:
-      res = inst.getType()->isIntegerTy(1U) ? ast.CreateLOr(lhs, rhs)
-                                            : ast.CreateOr(lhs, rhs);
+      if (inst.getType()->isIntegerTy(1U)) {
+        res = ast.CreateLOr(lhs, rhs);
+        dec_ctx.stmt_provenance[res] = &inst;
+        dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+        TrackExpressionPosition(dec_ctx, res, "Binary LOr");
+      } else {
+        res = ast.CreateOr(lhs, rhs);
+        dec_ctx.stmt_provenance[res] = &inst;
+        dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+        TrackExpressionPosition(dec_ctx, res, "Binary Or");
+      }
       break;
 
     case llvm::BinaryOperator::Xor:
       res = ast.CreateXor(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary Xor");
       break;
 
     case llvm::BinaryOperator::URem:
       res = ast.CreateRem(IntSignCast(lhs, false), IntSignCast(rhs, false));
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary URem");
       break;
 
     case llvm::BinaryOperator::SRem:
       res = ast.CreateRem(IntSignCast(lhs, true), IntSignCast(rhs, true));
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary SRem");
       break;
 
     case llvm::BinaryOperator::UDiv:
       res = ast.CreateDiv(IntSignCast(lhs, false), IntSignCast(rhs, false));
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary UDiv");
       break;
 
     case llvm::BinaryOperator::SDiv:
       res = ast.CreateDiv(IntSignCast(lhs, true), IntSignCast(rhs, true));
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary SDiv");
       break;
 
     case llvm::BinaryOperator::FDiv:
       res = ast.CreateDiv(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary FDiv");
       break;
 
     case llvm::BinaryOperator::Add:
-    case llvm::BinaryOperator::FAdd:
       res = ast.CreateAdd(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary Add");
       break;
 
     case llvm::BinaryOperator::Sub:
-    case llvm::BinaryOperator::FSub:
       res = ast.CreateSub(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary Sub");
       break;
 
     case llvm::BinaryOperator::Mul:
+      res = ast.CreateMul(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary Mul");
+      break;
+
     case llvm::BinaryOperator::FMul:
       res = ast.CreateMul(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary FMul");
+      break;
+
+    case llvm::BinaryOperator::FAdd:
+      res = ast.CreateAdd(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary FAdd");
+      break;
+
+    case llvm::BinaryOperator::FSub:
+      res = ast.CreateSub(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary FSub");
       break;
 
     default:
-      THROW() << "Unknown BinaryOperator: " << inst.getOpcodeName();
-      return nullptr;
+      THROW() << "Unknown BinaryOperator opcode";
+      break;
   }
   return res;
 }
@@ -786,74 +969,119 @@ clang::Expr *ExprGen::visitCmpInst(llvm::CmpInst &inst) {
     case llvm::CmpInst::ICMP_SGT:
     case llvm::CmpInst::FCMP_OGT:
       res = ast.CreateGT(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary GT");
       break;
 
     case llvm::CmpInst::ICMP_ULT:
     case llvm::CmpInst::ICMP_SLT:
     case llvm::CmpInst::FCMP_OLT:
       res = ast.CreateLT(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary LT");
       break;
 
     case llvm::CmpInst::ICMP_UGE:
     case llvm::CmpInst::ICMP_SGE:
     case llvm::CmpInst::FCMP_OGE:
       res = ast.CreateGE(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary GE");
       break;
 
     case llvm::CmpInst::ICMP_ULE:
     case llvm::CmpInst::ICMP_SLE:
     case llvm::CmpInst::FCMP_OLE:
       res = ast.CreateLE(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary LE");
       break;
 
     case llvm::CmpInst::ICMP_EQ:
     case llvm::CmpInst::FCMP_OEQ:
       res = ast.CreateEQ(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary EQ");
       break;
 
     case llvm::CmpInst::ICMP_NE:
       res = ast.CreateNE(lhs, rhs);
+      dec_ctx.stmt_provenance[res] = &inst;
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      TrackExpressionPosition(dec_ctx, res, "Binary NE");
       break;
 
     case llvm::CmpInst::FCMP_UGT:
       res = ast.CreateBuiltinCall(clang::Builtin::BI__builtin_isgreater, args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin isgreater");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_ULT:
       res = ast.CreateBuiltinCall(clang::Builtin::BI__builtin_isless, args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin isless");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_UGE:
       res = ast.CreateBuiltinCall(clang::Builtin::BI__builtin_isgreaterequal,
                                   args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin isgreaterequal");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_ULE:
       res =
           ast.CreateBuiltinCall(clang::Builtin::BI__builtin_islessequal, args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin islessequal");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_UNE:
       res = ast.CreateBuiltinCall(clang::Builtin::BI__builtin_islessgreater,
                                   args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin islessgreater");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_UNO:
       res =
           ast.CreateBuiltinCall(clang::Builtin::BI__builtin_isunordered, args);
+      TrackExpressionPosition(dec_ctx, res, "Builtin isunordered");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_ORD:
       res = ast.CreateLNot(
           ast.CreateBuiltinCall(clang::Builtin::BI__builtin_isunordered, args));
+      TrackExpressionPosition(dec_ctx, res, "Builtin isunordered");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_TRUE:
       res = ast.CreateTrue();
+      TrackExpressionPosition(dec_ctx, res, "True");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     case llvm::CmpInst::FCMP_FALSE:
       res = ast.CreateFalse();
+      TrackExpressionPosition(dec_ctx, res, "False");
+      dec_ctx.use_provenance[res] = &inst.getOperandUse(0);
+      dec_ctx.stmt_provenance[res] = &inst;
       break;
 
     default:
@@ -940,7 +1168,9 @@ clang::Expr *ExprGen::visitUnaryOperator(llvm::UnaryOperator &inst) {
       << "Unsupported UnaryOperator: " << LLVMThingToString(&inst);
 
   auto opnd{CreateOperandExpr(inst.getOperandUse(0))};
-  return ast.CreateUnaryOp(clang::UO_Minus, opnd);
+  auto res = ast.CreateUnaryOp(clang::UO_Minus, opnd);
+  TrackExpressionPosition(dec_ctx, res, "Unary Minus");
+  return res;
 }
 
 // StmtGen is tasked with populating blocks with their top-level

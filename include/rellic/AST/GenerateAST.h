@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include <clang/AST/Stmt.h>
 #include <llvm/Analysis/RegionInfo.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/PassManager.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <z3++.h>
 
 #include <limits>
@@ -21,6 +23,8 @@
 #include "rellic/AST/IRToASTVisitor.h"
 
 namespace rellic {
+
+class DecompilationContext;
 
 class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
  private:
@@ -42,6 +46,10 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   llvm::LoopInfo *loops;
 
   std::vector<llvm::BasicBlock *> rpo_walk;
+
+  // Line number tracking
+  unsigned current_line{1};
+  std::unordered_map<std::string, unsigned> bb_line_map;
 
   // GetOrCreateEdgeForBranch(branch, true) will return the index of an
   // expression that is true when branch is taken.
@@ -83,6 +91,11 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   Result run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
 
   static void run(llvm::Module &M, DecompilationContext &dec_ctx);
+
+  // Get the basic block to line number mapping
+  const std::unordered_map<std::string, unsigned>& GetBBToLineMap() const {
+    return bb_line_map;
+  }
 };
 
 }  // namespace rellic

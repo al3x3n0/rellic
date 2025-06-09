@@ -79,20 +79,34 @@ function GetArchVersion
 function DownloadVcpkgLibraries
 {
   local GITHUB_LIBS="${LIBRARY_VERSION}.tar.xz"
-  local URL="https://github.com/lifting-bits/cxx-common/releases/download/${CXX_COMMON_VERSION}/${GITHUB_LIBS}"
+
+  # If we're in a Docker build, the libraries should already be in place
+  if [[ -d "${DOWNLOAD_DIR}/${LIBRARY_VERSION}" ]]; then
+    echo "[-] Using existing vcpkg libraries in ${DOWNLOAD_DIR}/${LIBRARY_VERSION}"
+    return 0
+  fi
 
   mkdir -p "${DOWNLOAD_DIR}"
   pushd "${DOWNLOAD_DIR}" || return 1
 
-  if test -e "${GITHUB_LIBS}"
-    then zflag=(-z "${GITHUB_LIBS}")
-    else zflag=()
-  fi
+  # Skip download if the file already exists locally
+  if [[ -f "${CURR_DIR}/${GITHUB_LIBS}" ]]; then
+    echo "[-] Using local vcpkg libraries archive ${GITHUB_LIBS}"
+    cp "${CURR_DIR}/${GITHUB_LIBS}" .
+  else
+    local URL="https://github.com/lifting-bits/cxx-common/releases/download/${CXX_COMMON_VERSION}/${GITHUB_LIBS}"
 
-  echo "Fetching: ${URL} and placing in ${DOWNLOAD_DIR}"
-  if ! curl -o "${GITHUB_LIBS}" "${zflag[@]}" -L "${URL}"; then
-    echo "Curl failed"
-    return 1
+    if test -e "${GITHUB_LIBS}"
+      then zflag=(-z "${GITHUB_LIBS}")
+      else zflag=()
+    fi
+
+    echo "Fetching: ${URL} and placing in ${DOWNLOAD_DIR}"
+    if ! curl -o "${GITHUB_LIBS}" "${zflag[@]}" -L "${URL}"; then
+      echo "Curl failed"
+      popd || return 1
+      return 1
+    fi
   fi
 
   local TAR_OPTIONS="--warning=no-timestamp"
@@ -103,12 +117,16 @@ function DownloadVcpkgLibraries
   (
     set -x
     tar -xJf "${GITHUB_LIBS}" ${TAR_OPTIONS}
-  ) || return $?
-  popd || return 1
+  ) || {
+    local ret=$?
+    popd || return 1
+    return $ret
+  }
 
   # Make sure modification times are not in the future.
-  find "${DOWNLOAD_DIR}/${LIBRARY_VERSION}" -type f -exec touch {} \;
+  find "${LIBRARY_VERSION}" -type f -exec touch {} \;
 
+  popd || return 1
   return 0
 }
 

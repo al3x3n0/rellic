@@ -157,6 +157,8 @@ Result<DecompilationResult, DecompilationError> Decompile(
     DecompilationResult result{};
     result.ast = std::move(ast_unit);
     result.module = std::move(module);
+
+    // Copy maps using the helper function
     CopyMap(dec_ctx.stmt_provenance, result.stmt_provenance_map,
             result.value_to_stmt_map);
     CopyMap(dec_ctx.value_decls, result.value_to_decl_map,
@@ -164,6 +166,21 @@ Result<DecompilationResult, DecompilationError> Decompile(
     CopyMap(dec_ctx.type_decls, result.type_to_decl_map,
             result.type_provenance_map);
     CopyMap(dec_ctx.use_provenance, result.expr_use_map, result.use_expr_map);
+
+    // Copy the basic block to line mapping
+    result.bb_to_line_map = dec_ctx.bb_line_map;
+    
+    // Copy expression positions map element by element
+    for (const auto &[expr_id, info] : dec_ctx.expr_positions) {
+      ExpressionInfo result_info;
+      result_info.type = info.type;
+      result_info.llvm_ir = info.llvm_ir;  // Copy LLVM IR directly
+      result_info.start_line = info.start_line;
+      result_info.start_col = info.start_col;
+      result_info.end_line = info.end_line;
+      result_info.end_col = info.end_col;
+      result.expr_positions[expr_id] = result_info;
+    }
 
     return Result<DecompilationResult, DecompilationError>(std::move(result));
   } catch (Exception& ex) {

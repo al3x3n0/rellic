@@ -533,4 +533,37 @@ clang::QualType DecompilationContext::GetQualType(llvm::Type *type) {
 
   return result;
 }
+
+std::string DecompilationContext::GenerateExpressionId(clang::Expr *expr) {
+  std::string id;
+  llvm::raw_string_ostream os(id);
+  
+  // Add expression class name
+  os << expr->getStmtClassName();
+  
+  // Add source location info
+  auto &sm = ast_ctx.getSourceManager();
+  auto start_loc = expr->getBeginLoc();
+  auto end_loc = expr->getEndLoc();
+  
+  if (start_loc.isValid() && end_loc.isValid()) {
+    os << "_" << sm.getSpellingLineNumber(start_loc)
+       << "_" << sm.getSpellingColumnNumber(start_loc)
+       << "_" << sm.getSpellingLineNumber(end_loc)
+       << "_" << sm.getSpellingColumnNumber(end_loc);
+  }
+  
+  // Add type-specific info
+  if (auto binary = llvm::dyn_cast<clang::BinaryOperator>(expr)) {
+    os << "_" << binary->getOpcodeStr().str();
+  } else if (auto unary = llvm::dyn_cast<clang::UnaryOperator>(expr)) {
+    os << "_" << unary->getOpcodeStr(unary->getOpcode()).str();
+  } else if (auto decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
+    if (auto decl = decl_ref->getDecl()) {
+      os << "_" << decl->getNameAsString();
+    }
+  }
+  
+  return os.str();
+}
 }  // namespace rellic

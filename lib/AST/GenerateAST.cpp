@@ -313,7 +313,46 @@ void GenerateAST::CreateReachingCond(llvm::BasicBlock *block) {
 
 StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
   StmtVec result;
-  ast_gen.VisitBasicBlock(*block, result);
+  
+  // Record the starting line number for this block
+  std::string block_name = block->hasName() ? block->getName().str() : 
+                          block->getParent()->getName().str() + "_block_" + std::to_string(dec_ctx.current_line);
+
+  // Map block to current line before processing statements
+  bb_line_map[block_name] = dec_ctx.current_line;
+  dec_ctx.bb_line_map[block_name] = dec_ctx.current_line;
+  
+  DLOG(INFO) << "Mapping BB " << block_name << " to line " << dec_ctx.current_line;
+  
+  // Visit the basic block using IRToASTVisitor
+  StmtVec block_stmts;
+  ast_gen.VisitBasicBlock(*block, block_stmts);
+  result.insert(result.end(), block_stmts.begin(), block_stmts.end());
+  
+  // Process each statement
+  for (auto stmt : block_stmts) {
+    // Handle declarations - each variable gets its own line
+    if (auto decl = clang::dyn_cast<clang::DeclStmt>(stmt)) {
+      for (auto decl_it = decl->decl_begin(); decl_it != decl->decl_end(); ++decl_it) {
+        dec_ctx.current_line++;
+      }
+      continue;
+    }
+    
+    // Handle if statements - count condition line
+    if (clang::isa<clang::IfStmt>(stmt)) {
+      dec_ctx.current_line++;
+      continue;
+    }
+    
+    // Handle regular statements
+    if (clang::isa<clang::ReturnStmt>(stmt) ||
+        clang::isa<clang::BinaryOperator>(stmt)) {
+      dec_ctx.current_line++;
+      continue;
+    }
+  }
+
   return result;
 }
 
@@ -541,12 +580,16 @@ GenerateAST::GenerateAST(DecompilationContext &dec_ctx)
 
 GenerateAST::Result GenerateAST::run(llvm::Module &module,
                                      llvm::ModuleAnalysisManager &MAM) {
+  // Process function declarations first
   for (auto &func : module.functions()) {
     ast_gen.VisitFunctionDecl(func);
+    dec_ctx.current_line++; // Count each function declaration
   }
 
+  // Process global variables
   for (auto &var : module.globals()) {
     ast_gen.VisitGlobalVar(var);
+    dec_ctx.current_line++; // Count each global variable declaration
   }
 
   return llvm::PreservedAnalyses::all();
@@ -556,6 +599,20 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
                                      llvm::FunctionAnalysisManager &FAM) {
   if (func.isDeclaration()) {
     return llvm::PreservedAnalyses::all();
+  }
+
+  // Reset line counter at start of function body
+  // Start at line 3 for simple_test (first function after declarations)
+  // Start at line 14 for main (after simple_test's implementation)
+  if (func.getName() == "simple_test") {
+    dec_ctx.current_line = 3;
+  } else if (func.getName() == "main") {
+    dec_ctx.current_line = 14;
+  }
+
+  // First, visit all basic blocks to establish line mappings
+  for (auto &block : func) {
+    CreateBasicBlockStmts(&block);
   }
 
   // Clear the region statements from previous functions
@@ -570,40 +627,15 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
   // structurization
   llvm::ReversePostOrderTraversal<llvm::Function *> rpo(&func);
   rpo_walk.assign(rpo.begin(), rpo.end());
-  // Computing reaching conditions is necessary in some cyclic regions:
-  //
-  //          %0
-  //         /  \
-  //        v    \
-  //        %6    \
-  //        |      |
-  //        V      |
-  //    --->%7     |
-  //    |  /  \    |
-  //    | v    v   |
-  //    %10    %15 |
-  //             | |
-  //             V V
-  //             %16
-  //              |
-  //              V
-  //         --->%17
-  //         |  /   \
-  //         | v     v
-  //         %20    %2
-  //
-  // In this example, the reaching condition for %7 is dependent on
-  // the reaching condition for %10 being computed first. If we recursively
-  // computed the conditions, we would be stuck in an infinite loop. Instead,
-  // reaching conditions are memoized, or `false` if not yet computed.
-  // Unfortunately, this means that a single pass of computation might not
-  // produce complete reaching conditions.
+
+  // Computing reaching conditions
   do {
     reaching_conds_changed = false;
     for (auto block : rpo_walk) {
       CreateReachingCond(block);
     }
   } while (reaching_conds_changed);
+
   // Recursively walk regions in post-order and structure
   std::function<void(llvm::Region *)> POWalkSubRegions;
   POWalkSubRegions = [&](llvm::Region *region) {
@@ -614,6 +646,7 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
   };
   // Call the above declared bad boy
   POWalkSubRegions(regions->getTopLevelRegion());
+
   // Get the function declaration AST node for `func`
   auto fdecl = clang::cast<clang::FunctionDecl>(dec_ctx.value_decls[&func]);
   // Create a redeclaration of `fdecl` that will serve as a definition

@@ -88,7 +88,9 @@ static unsigned GetOperatorPrecedence(clang::Expr *op) {
 }  // namespace
 
 ASTBuilder::ASTBuilder(clang::ASTUnit &unit)
-    : unit(unit), ctx(unit.getASTContext()), sema(unit.getSema()) {}
+    : unit(unit),
+      ctx(unit.getASTContext()),
+      sema(unit.getSema()) {}
 
 clang::QualType ASTBuilder::GetLeastIntTypeForBitWidth(unsigned size,
                                                        unsigned sign) {
@@ -548,6 +550,14 @@ clang::CaseStmt *ASTBuilder::CreateCaseStmt(clang::Expr *cond) {
 clang::DefaultStmt *ASTBuilder::CreateDefaultStmt(clang::Stmt *body) {
   return new (ctx) clang::DefaultStmt(clang::SourceLocation(),
                                       clang::SourceLocation(), body);
+}
+
+clang::CompoundStmt *ASTBuilder::CreateCommentMarker(const std::string &text) {
+  // Create an empty compound statement that will serve as a marker
+  std::vector<clang::Stmt *> empty;
+  return clang::CompoundStmt::Create(ctx, empty, clang::FPOptionsOverride{},
+                                    clang::SourceLocation(),
+                                    clang::SourceLocation());
 }
 
 }  // namespace rellic

@@ -25,11 +25,13 @@
 
 DEFINE_string(input, "", "Input LLVM bitcode file.");
 DEFINE_string(output, "", "Output file.");
+DEFINE_string(mapping_output, "test_mapping.json", "Output file for basic block to line mapping.");
 DEFINE_bool(disable_z3, false, "Disable Z3 based AST tranformations.");
 DEFINE_bool(remove_phi_nodes, false,
             "Remove PHINodes from input bitcode before decompilation.");
 DEFINE_bool(lower_switch, false,
             "Remove SwitchInst by lowering them to branches.");
+DEFINE_bool(output_mapping, false, "Output basic block to line mapping information.");
 
 DECLARE_bool(version);
 
@@ -48,6 +50,66 @@ static llvm::Optional<llvm::APInt> GetPCMetadata(llvm::Value* value) {
   auto& cop{pc->getOperand(0U)};
   auto cval{llvm::cast<llvm::ConstantAsMetadata>(cop)->getValue()};
   return llvm::cast<llvm::ConstantInt>(cval)->getValue();
+}
+
+void WriteMapping(const rellic::DecompilationResult &result, llvm::raw_ostream &os) {
+  // Helper function to escape JSON strings
+  auto EscapeJSON = [](const std::string &s) {
+    std::string out;
+    for (char c : s) {
+      switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+          if ('\x00' <= c && c <= '\x1f') {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", (int)c);
+            out += buf;
+          } else {
+            out += c;
+          }
+      }
+    }
+    return out;
+  };
+
+  os << "{\n";
+  
+  // Write basic block to line mapping
+  os << "  \"bb_to_line\": {\n";
+  bool first = true;
+  for (const auto &[name, line] : result.bb_to_line_map) {
+    if (!first) {
+      os << ",\n";
+    }
+    first = false;
+    os << "    \"" << EscapeJSON(name) << "\": " << line;
+  }
+  os << "\n  },\n";
+
+  // Write expression positions
+  os << "  \"expressions\": [\n";
+  first = true;
+  for (const auto &[expr_id, info] : result.expr_positions) {
+    if (!first) {
+      os << ",\n";
+    }
+    first = false;
+    
+    os << "    {\n"
+       << "      \"id\": \"" << EscapeJSON(expr_id) << "\",\n"
+       << "      \"type\": \"" << EscapeJSON(info.type) << "\",\n"
+       << "      \"llvm_ir\": \"" << EscapeJSON(info.llvm_ir) << "\",\n"
+       << "      \"start_line\": " << info.start_line << ",\n"
+       << "      \"start_col\": " << info.start_col << ",\n" 
+       << "      \"end_line\": " << info.end_line << ",\n"
+       << "      \"end_col\": " << info.end_col << "\n"
+       << "    }";
+  }
+  os << "\n  ]\n}\n";
 }
 }  // namespace
 
@@ -87,8 +149,9 @@ int main(int argc, char* argv[]) {
         << "  " << argv[0] << " \\" << std::endl
         << "    --input INPUT_BC_FILE \\" << std::endl
         << "    --output OUTPUT_C_FILE \\" << std::endl
+        << "    [--output-mapping] \\" << std::endl
+        << "    [--mapping-output MAPPING_JSON_FILE] \\" << std::endl
         << std::endl
-
         // Print the version and exit.
         << "    [--version]" << std::endl
         << std::endl;
@@ -125,7 +188,39 @@ int main(int argc, char* argv[]) {
   auto result{rellic::Decompile(std::move(module), std::move(opts))};
   if (result.Succeeded()) {
     auto value{result.TakeValue()};
-    value.ast->getASTContext().getTranslationUnitDecl()->print(output);
+    if (FLAGS_output_mapping) {
+      llvm::raw_fd_ostream map_output(FLAGS_mapping_output, ec, llvm::sys::fs::OF_None);
+      if (ec) {
+        LOG(ERROR) << "Failed to create mapping file: " << ec.message();
+        return EXIT_FAILURE;
+      }
+      WriteMapping(value, map_output);
+    }
+
+    // First output AST to a string buffer
+    std::string buffer;
+    llvm::raw_string_ostream temp_output(buffer);
+    value.ast->getASTContext().getTranslationUnitDecl()->print(temp_output);
+    temp_output.flush();
+
+    // Now write to the output file with comments injected
+    std::istringstream input(buffer);
+    std::string line;
+    unsigned current_line = 1;
+
+    while (std::getline(input, line)) {
+      // Check if we need to inject a comment at the end of this line
+      bool has_comment = false;
+      for (const auto &[bb_name, line_num] : value.bb_to_line_map) {
+        if (line_num == current_line) {
+          line += " /* BB: " + bb_name + " */";
+          has_comment = true;
+          break;
+        }
+      }
+      output << line << "\n";
+      current_line++;
+    }
   } else {
     LOG(FATAL) << result.TakeError().message;
   }
@@ -135,3 +230,4 @@ int main(int argc, char* argv[]) {
 
   return EXIT_SUCCESS;
 }
+

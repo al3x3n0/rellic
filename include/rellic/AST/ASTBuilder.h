@@ -12,6 +12,8 @@
 #include <clang/Frontend/ASTUnit.h>
 
 #include <string>
+#include <vector>
+#include <sstream>
 
 namespace clang {
 class Sema;
@@ -315,6 +317,51 @@ class ASTBuilder {
   clang::SwitchStmt *CreateSwitchStmt(clang::Expr *cond);
   clang::CaseStmt *CreateCaseStmt(clang::Expr *cond);
   clang::DefaultStmt *CreateDefaultStmt(clang::Stmt *body);
+
+  // Creates a marker statement that looks like a comment in the output
+  clang::CompoundStmt *CreateCommentMarker(const std::string &text);
+
+  clang::BinaryOperator *CreateBinaryOperator(clang::Expr *lhs, clang::Expr *rhs,
+                                             clang::BinaryOperator::Opcode opc,
+                                             clang::QualType res_type);
+
+  // Helper function to get expression from ID
+  clang::Expr *GetExprFromId(const std::string &id) {
+    // Parse the ID to get line and column numbers
+    size_t pos = id.find('_');
+    if (pos == std::string::npos) return nullptr;
+    
+    std::string class_name = id.substr(0, pos);
+    std::string loc_info = id.substr(pos + 1);
+    
+    // Parse line and column numbers
+    std::vector<unsigned> nums;
+    std::stringstream ss(loc_info);
+    std::string item;
+    while (std::getline(ss, item, '_')) {
+      if (!item.empty()) {
+        try {
+          nums.push_back(std::stoul(item));
+        } catch (...) {
+          break;
+        }
+      }
+    }
+    
+    if (nums.size() < 4) return nullptr;
+    
+    // Create source location
+    auto &sm = ctx.getSourceManager();
+    auto start_loc = sm.translateLineCol(sm.getMainFileID(), nums[0], nums[1]);
+    auto end_loc = sm.translateLineCol(sm.getMainFileID(), nums[2], nums[3]);
+    
+    // Find the expression at this location
+    clang::SourceRange range(start_loc, end_loc);
+    
+    // TODO: Traverse AST to find expression at this location
+    // For now, return nullptr as this requires more complex AST traversal
+    return nullptr;
+  }
 };
 
 }  // namespace rellic

@@ -31,12 +31,29 @@ struct DecompilationContext {
   using BlockToUsesMap =
       std::unordered_map<llvm::BasicBlock *, std::vector<llvm::Use *>>;
   using Z3CondMap = std::unordered_map<clang::Stmt *, unsigned>;
+  using BBToLineMap = std::unordered_map<std::string, unsigned>;
+  
+  // Expression position info struct
+  struct ExpressionInfo {
+    std::string type;  // Expression type (e.g. "Binary Add", "Unary Minus")
+    std::string llvm_ir;  // LLVM IR instruction that generated this expression
+    unsigned start_line;
+    unsigned start_col;
+    unsigned end_line;
+    unsigned end_col;
+  };
+  
+  // Map using expression ID as key
+  using ExprPositionsMap = std::unordered_map<std::string, ExpressionInfo>;
 
   using BBEdge = std::pair<llvm::BasicBlock *, llvm::BasicBlock *>;
   using BrEdge = std::pair<llvm::BranchInst *, bool>;
   using SwEdge = std::pair<llvm::SwitchInst *, llvm::ConstantInt *>;
 
   DecompilationContext(clang::ASTUnit &ast_unit);
+
+  // Helper function to generate a unique ID for an expression
+  std::string GenerateExpressionId(clang::Expr *expr);
 
   clang::ASTUnit &ast_unit;
   clang::ASTContext &ast_ctx;
@@ -53,6 +70,11 @@ struct DecompilationContext {
   z3::context z3_ctx;
   z3::expr_vector z3_exprs{z3_ctx};
   Z3CondMap conds;
+  BBToLineMap bb_line_map;
+  ExprPositionsMap expr_positions;
+
+  // Current line number during decompilation
+  unsigned current_line{1};
 
   clang::Expr *marker_expr;
 
