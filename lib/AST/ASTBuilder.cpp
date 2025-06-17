@@ -553,11 +553,37 @@ clang::DefaultStmt *ASTBuilder::CreateDefaultStmt(clang::Stmt *body) {
 }
 
 clang::CompoundStmt *ASTBuilder::CreateCommentMarker(const std::string &text) {
-  // Create an empty compound statement that will serve as a marker
-  std::vector<clang::Stmt *> empty;
-  return clang::CompoundStmt::Create(ctx, empty, clang::FPOptionsOverride{},
-                                    clang::SourceLocation(),
-                                    clang::SourceLocation());
+  // Create a call to a special marker function that will be recognized during output
+  // This creates: __builtin_rellic_bb_marker("bb_name");
+  
+  // Create the function identifier
+  auto id = CreateIdentifier("__builtin_rellic_bb_marker");
+  
+  // Create a function type: void(const char*)
+  clang::QualType char_ptr_type = ctx.getPointerType(ctx.CharTy.withConst());
+  clang::QualType func_type = ctx.getFunctionType(
+      ctx.VoidTy, {char_ptr_type}, clang::FunctionProtoType::ExtProtoInfo());
+  
+  // Create a function declaration
+  auto func_decl = clang::FunctionDecl::Create(
+      ctx, ctx.getTranslationUnitDecl(), clang::SourceLocation(),
+      clang::SourceLocation(), id, func_type, nullptr, clang::SC_None);
+  func_decl->setImplicit(true);
+  
+  // Create the string literal argument
+  auto str_lit = CreateStrLit(text);
+  
+  // Create a DeclRefExpr for the function
+  auto func_ref = CreateDeclRef(func_decl);
+  
+  // Create the function call
+  auto call = clang::CallExpr::Create(
+      ctx, func_ref, {str_lit}, ctx.VoidTy, clang::VK_PRValue,
+      clang::SourceLocation(), clang::FPOptionsOverride());
+  
+  // Wrap in a compound statement
+  std::vector<clang::Stmt *> stmts = {call};
+  return CreateCompoundStmt(stmts);
 }
 
 }  // namespace rellic

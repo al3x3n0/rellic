@@ -46,6 +46,9 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   llvm::LoopInfo *loops;
 
   std::vector<llvm::BasicBlock *> rpo_walk;
+  
+  // Track block names for consistent naming
+  std::unordered_map<llvm::BasicBlock*, std::string> block_names;
 
   // Line number tracking
   unsigned current_line{1};
@@ -82,6 +85,9 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   clang::CompoundStmt *StructureCyclicRegion(llvm::Region *region);
   clang::CompoundStmt *StructureSwitchRegion(llvm::Region *region);
   clang::CompoundStmt *StructureRegion(llvm::Region *region);
+
+  // Process all struct declarations in the module before processing functions
+  void ProcessStructs(llvm::Module &module);
 
  public:
   using Result = llvm::PreservedAnalyses;

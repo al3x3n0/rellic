@@ -72,6 +72,20 @@ struct DecompilationContext {
   Z3CondMap conds;
   BBToLineMap bb_line_map;
   ExprPositionsMap expr_positions;
+  std::unordered_map<const llvm::Function*, unsigned> function_start_lines;
+  std::unordered_map<std::string, clang::Stmt*> bb_first_stmt_map;
+  std::unordered_map<std::string, bool> bb_is_entry;
+  std::unordered_map<clang::Stmt*, std::string> stmt_to_bb;
+  std::unordered_map<std::string, std::vector<clang::Stmt*>> bb_to_stmts;
+  
+  // Map control flow statements to their corresponding BBs
+  std::unordered_map<clang::Stmt*, std::string> control_flow_to_bb;
+  // Map BBs to their LLVM BasicBlock for better tracking
+  std::unordered_map<std::string, llvm::BasicBlock*> bb_name_to_llvm_bb;
+  // Map statements to their containing function for proper scoping
+  std::unordered_map<clang::Stmt*, llvm::Function*> stmt_to_func;
+  // Track which BBs belong to which functions
+  std::unordered_map<std::string, llvm::Function*> bb_to_func;
 
   // Current line number during decompilation
   unsigned current_line{1};

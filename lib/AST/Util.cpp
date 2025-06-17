@@ -493,18 +493,24 @@ clang::QualType DecompilationContext::GetQualType(llvm::Type *type) {
 
         // Create a C struct declaration
         decl = sdecl = ast.CreateStructDecl(tudecl, sname);
+        printf("[DEBUG] Line increment for struct declaration '%s' from %u to %u\n", sname.c_str(), current_line, current_line + 1); fflush(stdout);
+        current_line++; // Increment line for struct declaration
 
         // Add fields to the C struct
         for (auto ecnt{0U}; ecnt < strct->getNumElements(); ++ecnt) {
           auto etype{GetQualType(strct->getElementType(ecnt))};
           auto fname{"field" + std::to_string(ecnt)};
           sdecl->addDecl(ast.CreateFieldDecl(sdecl, etype, fname));
+          printf("[DEBUG] Line increment for struct field '%s.%s' from %u to %u\n", sname.c_str(), fname.c_str(), current_line, current_line + 1); fflush(stdout);
+          current_line++; // Increment line for each field
         }
 
         // Complete the C struct definition
         sdecl->completeDefinition();
         // Add C struct to translation unit
         tudecl->addDecl(sdecl);
+        printf("[DEBUG] Line increment for struct closing brace '%s' from %u to %u\n", sname.c_str(), current_line, current_line + 1); fflush(stdout);
+        current_line++; // Increment line for closing brace
 
       } else {
         sdecl = clang::cast<clang::RecordDecl>(decl);
@@ -516,20 +522,10 @@ clang::QualType DecompilationContext::GetQualType(llvm::Type *type) {
       result = ast_ctx.VoidPtrTy;
       break;
 
-    default: {
-      if (type->isVectorTy()) {
-        auto vtype{llvm::cast<llvm::FixedVectorType>(type)};
-        auto etype{GetQualType(vtype->getElementType())};
-        auto ecnt{vtype->getNumElements()};
-        auto vkind{clang::VectorType::GenericVector};
-        result = ast_ctx.getVectorType(etype, ecnt, vkind);
-      } else {
-        THROW() << "Unknown LLVM Type: " << LLVMThingToString(type);
-      }
-    } break;
+    default:
+      THROW() << "Unsupported LLVM type: " << LLVMThingToString(type);
+      break;
   }
-
-  CHECK_THROW(!result.isNull()) << "Unknown LLVM Type";
 
   return result;
 }

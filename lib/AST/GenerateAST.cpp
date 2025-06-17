@@ -314,45 +314,76 @@ void GenerateAST::CreateReachingCond(llvm::BasicBlock *block) {
 StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
   StmtVec result;
   
-  // Record the starting line number for this block
-  std::string block_name = block->hasName() ? block->getName().str() : 
-                          block->getParent()->getName().str() + "_block_" + std::to_string(dec_ctx.current_line);
-
-  // Map block to current line before processing statements
-  bb_line_map[block_name] = dec_ctx.current_line;
-  dec_ctx.bb_line_map[block_name] = dec_ctx.current_line;
-  
-  DLOG(INFO) << "Mapping BB " << block_name << " to line " << dec_ctx.current_line;
-  
-  // Visit the basic block using IRToASTVisitor
-  StmtVec block_stmts;
-  ast_gen.VisitBasicBlock(*block, block_stmts);
-  result.insert(result.end(), block_stmts.begin(), block_stmts.end());
-  
-  // Process each statement
-  for (auto stmt : block_stmts) {
-    // Handle declarations - each variable gets its own line
-    if (auto decl = clang::dyn_cast<clang::DeclStmt>(stmt)) {
-      for (auto decl_it = decl->decl_begin(); decl_it != decl->decl_end(); ++decl_it) {
-        dec_ctx.current_line++;
-      }
-      continue;
+  // Use a sophisticated naming scheme based on IR characteristics
+  std::string block_name;
+  if (block->hasName()) {
+    block_name = block->getName().str();
+  } else if (block_names.count(block)) {
+    block_name = block_names[block];
+  } else {
+    // Generate a unique name based on IR hash and characteristics
+    auto func = block->getParent();
+    
+    // Create a hash based on the block's IR content
+    std::string ir_content;
+    llvm::raw_string_ostream stream(ir_content);
+    block->print(stream);
+    stream.flush();
+    
+    // Simple hash of the IR content
+    std::hash<std::string> hasher;
+    size_t ir_hash = hasher(ir_content);
+    
+    // Get block index for additional uniqueness
+    unsigned block_idx = 0;
+    for (auto &bb : *func) {
+      if (&bb == block) break;
+      block_idx++;
     }
     
-    // Handle if statements - count condition line
-    if (clang::isa<clang::IfStmt>(stmt)) {
-      dec_ctx.current_line++;
-      continue;
-    }
+    // Create sophisticated name: function_bb_<index>_<hash_suffix>
+    std::string hash_suffix = std::to_string(ir_hash).substr(0, 8);
+    block_name = func->getName().str() + "_bb_" + std::to_string(block_idx) + "_" + hash_suffix;
     
-    // Handle regular statements
-    if (clang::isa<clang::ReturnStmt>(stmt) ||
-        clang::isa<clang::BinaryOperator>(stmt)) {
-      dec_ctx.current_line++;
-      continue;
-    }
+    block_names[block] = block_name;
   }
 
+  // No need for line mapping with hash-based naming
+  
+  // Store the LLVM BB reference and function mapping
+  dec_ctx.bb_name_to_llvm_bb[block_name] = block;
+  dec_ctx.bb_to_func[block_name] = block->getParent();
+  
+  // printf("[DEBUG] BB '%s' from function '%s'\n", 
+  //        block_name.c_str(), block->getParent()->getName().str().c_str()); fflush(stdout);
+  
+  // Visit the basic block using IRToASTVisitor
+  ast_gen.VisitBasicBlock(*block, result);
+  
+  // Insert a BB marker at the beginning of the block
+  // This will appear as a comment in the output
+  if (!result.empty()) {
+    auto marker = dec_ctx.ast.CreateCommentMarker(block_name);
+    result.insert(result.begin(), marker);
+  }
+
+  // Store BB info even if it has no statements
+  dec_ctx.bb_is_entry[block_name] = (block == &block->getParent()->getEntryBlock());
+  
+  if (!result.empty()) {
+    if (dec_ctx.bb_first_stmt_map.find(block_name) == dec_ctx.bb_first_stmt_map.end()) {
+      dec_ctx.bb_first_stmt_map[block_name] = result.front();
+    }
+    
+    // Map all statements in this BB (preserve order)
+    for (auto stmt : result) {
+      dec_ctx.stmt_to_bb[stmt] = block_name;
+      dec_ctx.bb_to_stmts[block_name].push_back(stmt);
+    }
+  }
+  
+  // No need for line tracking with hash-based naming
+  
   return result;
 }
 
@@ -579,17 +610,18 @@ GenerateAST::GenerateAST(DecompilationContext &dec_ctx)
     : dec_ctx(dec_ctx), ast(dec_ctx.ast), ast_gen(dec_ctx) {}
 
 GenerateAST::Result GenerateAST::run(llvm::Module &module,
-                                     llvm::ModuleAnalysisManager &MAM) {
-  // Process function declarations first
-  for (auto &func : module.functions()) {
-    ast_gen.VisitFunctionDecl(func);
-    dec_ctx.current_line++; // Count each function declaration
-  }
+                                    llvm::ModuleAnalysisManager &MAM) {
+  // First process all struct declarations
+  ProcessStructs(module);
 
-  // Process global variables
+  // Then process global variables
   for (auto &var : module.globals()) {
     ast_gen.VisitGlobalVar(var);
-    dec_ctx.current_line++; // Count each global variable declaration
+  }
+
+  // Finally process function declarations
+  for (auto &func : module.functions()) {
+    ast_gen.VisitFunctionDecl(func);
   }
 
   return llvm::PreservedAnalyses::all();
@@ -601,40 +633,39 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
     return llvm::PreservedAnalyses::all();
   }
 
-  // Reset line counter at start of function body
-  // Start at line 3 for simple_test (first function after declarations)
-  // Start at line 14 for main (after simple_test's implementation)
-  if (func.getName() == "simple_test") {
-    dec_ctx.current_line = 3;
-  } else if (func.getName() == "main") {
-    dec_ctx.current_line = 14;
-  }
 
-  // First, visit all basic blocks to establish line mappings
-  for (auto &block : func) {
-    CreateBasicBlockStmts(&block);
-  }
 
   // Clear the region statements from previous functions
   region_stmts.clear();
-  // Get dominator tree
+  
+  // Get analysis results
   domtree = &FAM.getResult<llvm::DominatorTreeAnalysis>(func);
-  // Get single-entry, single-exit regions
   regions = &FAM.getResult<llvm::RegionInfoAnalysis>(func);
-  // Get loops
   loops = &FAM.getResult<llvm::LoopAnalysis>(func);
-  // Get a reverse post-order walk for iterating over region blocks in
-  // structurization
-  llvm::ReversePostOrderTraversal<llvm::Function *> rpo(&func);
-  rpo_walk.assign(rpo.begin(), rpo.end());
 
-  // Computing reaching conditions
-  do {
+  // Get blocks in reverse post-order for reaching conditions
+  rpo_walk.clear();
+  for (auto block : llvm::ReversePostOrderTraversal<llvm::Function *>(&func)) {
+    rpo_walk.push_back(block);
+  }
+
+  // Process each block once - both for statements and reaching conditions
+  std::unordered_map<llvm::BasicBlock*, StmtVec> block_stmts;
+  for (auto &block : func) {
+    // Generate statements and track line numbers
+    block_stmts[&block] = CreateBasicBlockStmts(&block);
+    
+    // Compute reaching conditions for this block
+    CreateReachingCond(&block);
+  }
+
+  // Iterate only if reaching conditions need more passes
+  while (reaching_conds_changed) {
     reaching_conds_changed = false;
     for (auto block : rpo_walk) {
       CreateReachingCond(block);
     }
-  } while (reaching_conds_changed);
+  }
 
   // Recursively walk regions in post-order and structure
   std::function<void(llvm::Region *)> POWalkSubRegions;
@@ -644,7 +675,6 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
     }
     StructureRegion(region);
   };
-  // Call the above declared bad boy
   POWalkSubRegions(regions->getTopLevelRegion());
 
   // Get the function declaration AST node for `func`
@@ -656,8 +686,15 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
   fdefn->setPreviousDecl(fdecl);
   dec_ctx.value_decls[&func] = fdefn;
   tudecl->addDecl(fdefn);
+  
+  // Track where this function definition starts
+  dec_ctx.function_start_lines[&func] = dec_ctx.current_line;
+  printf("[DEBUG] Processing function body for '%s' at current_line=%u\n", 
+         func.getName().str().c_str(), dec_ctx.current_line); fflush(stdout);
+  
   // Set parameters to the same as the previous declaration
   fdefn->setParams(fdecl->parameters());
+  
   // Create body of the function
   StmtVec fbody;
   // Add declarations of local variables
@@ -666,10 +703,12 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
       fbody.push_back(ast.CreateDeclStmt(decl));
     }
   }
+  
   // Add statements of the top-level region compound
   for (auto stmt : region_stmts[regions->getTopLevelRegion()]->body()) {
     fbody.push_back(stmt);
   }
+  
   // Set body to a new compound
   fdefn->setBody(ast.CreateCompoundStmt(fbody));
 
@@ -692,6 +731,109 @@ void GenerateAST::run(llvm::Module &module, DecompilationContext &dec_ctx) {
   pb.registerFunctionAnalyses(fam);
   for (auto &func : module.functions()) {
     fpm.run(func, fam);
+  }
+}
+
+void GenerateAST::ProcessStructs(llvm::Module &module) {
+  // Reset line counter since we're starting with structs
+  dec_ctx.current_line = 1;
+
+  // First pass: collect all struct types from the module
+  std::unordered_set<llvm::StructType*> struct_types;
+
+  // Check global variables
+  for (auto &global : module.globals()) {
+    if (auto struct_ty = llvm::dyn_cast<llvm::StructType>(global.getValueType())) {
+      struct_types.insert(struct_ty);
+    }
+  }
+
+  // Check functions and their bodies
+  for (auto &func : module) {
+    // Check function arguments
+    for (auto &arg : func.args()) {
+      if (auto struct_ty = llvm::dyn_cast<llvm::StructType>(arg.getType())) {
+        struct_types.insert(struct_ty);
+      }
+    }
+
+    // Skip declarations
+    if (func.isDeclaration()) {
+      continue;
+    }
+
+    // Check function body
+    for (auto &block : func) {
+      for (auto &inst : block) {
+        // Check instruction type
+        if (auto struct_ty = llvm::dyn_cast<llvm::StructType>(inst.getType())) {
+          struct_types.insert(struct_ty);
+        }
+
+        // Check operand types
+        for (auto &op : inst.operands()) {
+          if (auto struct_ty = llvm::dyn_cast<llvm::StructType>(op->getType())) {
+            struct_types.insert(struct_ty);
+          }
+        }
+      }
+    }
+  }
+
+  // Second pass: force declaration and emission of all collected struct types
+  auto tudecl = dec_ctx.ast_ctx.getTranslationUnitDecl();
+  
+  // Sort struct types by name for consistent ordering
+  std::vector<llvm::StructType*> sorted_types(struct_types.begin(), struct_types.end());
+  std::sort(sorted_types.begin(), sorted_types.end(), 
+    [](llvm::StructType* a, llvm::StructType* b) {
+      return a->getName() < b->getName();
+    });
+
+  // Force struct declarations at the start
+  for (auto struct_ty : sorted_types) {
+    // Get the struct declaration
+    auto qual_type = dec_ctx.GetQualType(struct_ty);
+    if (auto tag_type = qual_type->getAs<clang::TagType>()) {
+      if (auto decl = tag_type->getDecl()) {
+        // Create a new declaration at the translation unit level
+        auto new_decl = clang::RecordDecl::Create(
+          dec_ctx.ast_ctx, 
+          clang::TTK_Struct,
+          tudecl,  // New parent context
+          decl->getBeginLoc(),
+          decl->getLocation(),
+          decl->getIdentifier());
+
+        // Copy the fields from the original declaration
+        if (auto record_decl = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+          for (auto field : record_decl->fields()) {
+            auto new_field = clang::FieldDecl::Create(
+              dec_ctx.ast_ctx,
+              new_decl,
+              field->getBeginLoc(),
+              field->getLocation(),
+              field->getIdentifier(),
+              field->getType(),
+              field->getTypeSourceInfo(),
+              field->getBitWidth(),
+              field->isMutable(),
+              field->getInClassInitStyle());
+            new_decl->addDecl(new_field);
+          }
+        }
+
+        // Complete the definition if original was complete
+        if (auto record_decl = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+          if (record_decl->isCompleteDefinition()) {
+            new_decl->completeDefinition();
+          }
+        }
+
+        // Add to translation unit
+        tudecl->addDecl(new_decl);
+      }
+    }
   }
 }
 

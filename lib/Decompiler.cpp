@@ -167,8 +167,14 @@ Result<DecompilationResult, DecompilationError> Decompile(
             result.type_provenance_map);
     CopyMap(dec_ctx.use_provenance, result.expr_use_map, result.use_expr_map);
 
-    // Copy the basic block to line mapping
-    result.bb_to_line_map = dec_ctx.bb_line_map;
+    // Copy the basic block mappings (no line mapping needed with hash-based naming)
+    result.bb_first_stmt_map = dec_ctx.bb_first_stmt_map;
+    result.stmt_to_bb = dec_ctx.stmt_to_bb;
+    result.bb_is_entry = dec_ctx.bb_is_entry;
+    result.bb_to_stmts = dec_ctx.bb_to_stmts;
+    result.bb_name_to_llvm_bb = dec_ctx.bb_name_to_llvm_bb;
+    result.stmt_to_func = dec_ctx.stmt_to_func;
+    result.bb_to_func = dec_ctx.bb_to_func;
     
     // Copy expression positions map element by element
     for (const auto &[expr_id, info] : dec_ctx.expr_positions) {

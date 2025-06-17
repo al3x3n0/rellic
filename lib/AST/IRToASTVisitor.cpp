@@ -103,7 +103,9 @@ class ExprGen : public llvm::InstVisitor<ExprGen, clang::Expr *> {
   clang::Expr *visitAnyMemSetInst(llvm::AnyMemSetInst &inst);
   clang::Expr *visitIntrinsicInst(llvm::IntrinsicInst &inst);
   clang::Expr *visitCallInst(llvm::CallInst &inst);
+  clang::Expr *visitInvokeInst(llvm::InvokeInst &inst);
   clang::Expr *visitGetElementPtrInst(llvm::GetElementPtrInst &inst);
+  clang::Expr *visitLandingPadInst(llvm::LandingPadInst &inst);
   clang::Expr *visitInstruction(llvm::Instruction &inst);
   clang::Expr *visitExtractValueInst(llvm::ExtractValueInst &inst);
   clang::Expr *visitLoadInst(llvm::LoadInst &inst);
@@ -725,6 +727,63 @@ clang::Expr *ExprGen::visitGetElementPtrInst(llvm::GetElementPtrInst &inst) {
   return ast.CreateAddrOf(base);
 }
 
+clang::Expr *ExprGen::visitInvokeInst(llvm::InvokeInst &inst) {
+  DLOG(INFO) << "visitInvokeInst: " << LLVMThingToString(&inst);
+  
+  // Invoke is similar to call but with exception handling
+  // Generate the function call expression
+  std::vector<clang::Expr *> args;
+  for (auto i{0U}; i < inst.arg_size(); ++i) {
+    auto &arg{inst.getArgOperandUse(i)};
+    auto opnd{CreateOperandExpr(arg)};
+    if (inst.getParamAttr(i, llvm::Attribute::ByVal).isValid()) {
+      auto ptr_type{ast_ctx.getPointerType(
+          dec_ctx.GetQualType(inst.getParamByValType(i)))};
+      opnd = ast.CreateDeref(ast.CreateCStyleCast(ptr_type, opnd));
+      dec_ctx.use_provenance[opnd] = &arg;
+    }
+    args.push_back(opnd);
+  }
+  
+  clang::Expr *callexpr{nullptr};
+  auto &callee{*(inst.op_end() - 1)};
+  if (auto func = llvm::dyn_cast<llvm::Function>(callee)) {
+    auto fdecl{dec_ctx.value_decls[func]->getAsFunction()};
+    if (func->getFunctionType() == inst.getFunctionType()) {
+      callexpr = ast.CreateCall(fdecl, args);
+    } else {
+      // Cast function type to match the one used in the invoke instruction
+      auto funcPtr{
+          ast_ctx.getPointerType(dec_ctx.GetQualType(inst.getFunctionType()))};
+      auto callee{ast.CreateAddrOf(ast.CreateDeclRef(fdecl))};
+      auto cast{ast.CreateCStyleCast(funcPtr, callee)};
+      callexpr = ast.CreateCall(cast, args);
+    }
+  } else {
+    auto callee_expr{CreateOperandExpr(callee)};
+    auto callee_type{dec_ctx.GetQualType(callee->getType())};
+    callexpr = llvm::isa<clang::PointerType>(callee_type)
+                   ? ast.CreateCall(callee_expr, args)
+                   : ast.CreateCall(ast.CreateAddrOf(callee_expr), args);
+  }
+  
+  if (callexpr) {
+    dec_ctx.stmt_provenance[callexpr] = &inst;
+    TrackExpressionPosition(dec_ctx, callexpr, "Invoke Call");
+  }
+  
+  return callexpr;
+}
+
+clang::Expr *ExprGen::visitLandingPadInst(llvm::LandingPadInst &inst) {
+  DLOG(INFO) << "visitLandingPadInst: " << LLVMThingToString(&inst);
+  
+  // For now, return a null pointer expression representing the exception object
+  // This is a placeholder implementation that should be enhanced for proper
+  // exception handling support
+  return ast.CreateNull();
+}
+
 clang::Expr *ExprGen::visitInstruction(llvm::Instruction &inst) {
   THROW() << "Instruction not supported: " << LLVMThingToString(&inst);
   return nullptr;
@@ -1205,6 +1264,9 @@ class StmtGen : public llvm::InstVisitor<StmtGen, clang::Stmt *> {
   clang::Stmt *visitSwitchInst(llvm::SwitchInst &inst);
   clang::Stmt *visitUnreachableInst(llvm::UnreachableInst &inst);
   clang::Stmt *visitPHINode(llvm::PHINode &inst);
+  clang::Stmt *visitLandingPadInst(llvm::LandingPadInst &inst);
+  clang::Stmt *visitResumeInst(llvm::ResumeInst &inst);
+  clang::Stmt *visitInvokeInst(llvm::InvokeInst &inst);
   clang::Stmt *visitInstruction(llvm::Instruction &inst);
 };
 
@@ -1286,6 +1348,49 @@ clang::Stmt *StmtGen::visitUnreachableInst(llvm::UnreachableInst &inst) {
 }
 
 clang::Stmt *StmtGen::visitPHINode(llvm::PHINode &inst) { return nullptr; }
+
+clang::Stmt *StmtGen::visitLandingPadInst(llvm::LandingPadInst &inst) {
+  DLOG(INFO) << "visitLandingPadInst: " << LLVMThingToString(&inst);
+  
+  // For now, we'll create a simple variable assignment that represents
+  // the exception object. This is a basic implementation that can be
+  // enhanced later to generate proper try-catch blocks.
+  auto &var{dec_ctx.value_decls[&inst]};
+  if (var) {
+    // Create a call to a dummy exception handler function
+    // This will be replaced with proper exception handling later
+    auto exc_type = ast_ctx.VoidPtrTy;
+    auto null_expr = ast.CreateNull();
+    return ast.CreateAssign(ast.CreateDeclRef(var), null_expr);
+  }
+  return nullptr;
+}
+
+clang::Stmt *StmtGen::visitResumeInst(llvm::ResumeInst &inst) {
+  DLOG(INFO) << "visitResumeInst: " << LLVMThingToString(&inst);
+  
+  // Resume instruction rethrows the exception
+  // For now, we'll generate a return statement as a placeholder
+  // This should be replaced with proper exception rethrowing
+  return ast.CreateReturn(nullptr);
+}
+
+clang::Stmt *StmtGen::visitInvokeInst(llvm::InvokeInst &inst) {
+  DLOG(INFO) << "visitInvokeInst: " << LLVMThingToString(&inst);
+  
+  // Invoke is like a call instruction but with exception handling
+  // For now, we generate the call and ignore exception handling edges
+  auto &var{dec_ctx.value_decls[&inst]};
+  if (var && !inst.getType()->isVoidTy()) {
+    auto expr{expr_gen.visitInvokeInst(inst)};
+    return ast.CreateAssign(ast.CreateDeclRef(var), expr);
+  } else if (inst.getType()->isVoidTy()) {
+    // For void invoke, just create the expression statement
+    auto expr{expr_gen.visitInvokeInst(inst)};
+    return expr;
+  }
+  return nullptr;
+}
 
 clang::Stmt *StmtGen::visitInstruction(llvm::Instruction &inst) {
   auto &var{dec_ctx.value_decls[&inst]};
@@ -1370,6 +1475,9 @@ void IRToASTVisitor::VisitFunctionDecl(llvm::Function &func) {
   decl = ast.CreateFunctionDecl(tudecl, ftype, name);
 
   tudecl->addDecl(decl);
+  printf("[DEBUG] Line increment for function declaration '%s' from %u to %u\n", 
+         name.c_str(), dec_ctx.current_line, dec_ctx.current_line + 1); fflush(stdout);
+  dec_ctx.current_line++; // Increment line for function declaration
 
   std::vector<clang::ParmVarDecl *> params;
   for (auto &arg : func.args()) {

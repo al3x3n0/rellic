@@ -88,6 +88,15 @@ struct DecompilationResult {
   UseToExprMap use_expr_map;
   BBToLineMap bb_to_line_map;
   ExprPositionsMap expr_positions;
+  std::unordered_map<const llvm::Function*, unsigned> function_start_lines;
+  std::unordered_map<std::string, clang::Stmt*> bb_first_stmt_map;
+  std::unordered_map<clang::Stmt*, std::string> stmt_to_bb;
+  std::unordered_map<std::string, bool> bb_is_entry;
+  std::unordered_map<std::string, std::vector<clang::Stmt*>> bb_to_stmts;
+  std::unordered_map<clang::Stmt*, std::string> control_flow_to_bb;
+  std::unordered_map<std::string, llvm::BasicBlock*> bb_name_to_llvm_bb;
+  std::unordered_map<clang::Stmt*, llvm::Function*> stmt_to_func;
+  std::unordered_map<std::string, llvm::Function*> bb_to_func;
 };
 
 struct DecompilationError {
