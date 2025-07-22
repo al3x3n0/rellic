@@ -21,10 +21,16 @@
 
 #include <memory>
 
+#include <glog/logging.h>
+
+#include "rellic/AST/BooleanSimplify.h"
 #include "rellic/AST/CondBasedRefine.h"
 #include "rellic/AST/DeadStmtElim.h"
 #include "rellic/AST/DebugInfoCollector.h"
+#include "rellic/AST/ExceptionHandlingPass.h"
+#include "rellic/AST/ExceptionASTTransform.h"
 #include "rellic/AST/ExprCombine.h"
+#include "rellic/AST/Z3CondSimplify.h"
 #include "rellic/AST/GenerateAST.h"
 #include "rellic/AST/IRToASTVisitor.h"
 #include "rellic/AST/LocalDeclRenamer.h"
@@ -107,21 +113,79 @@ Result<DecompilationResult, DecompilationError> Decompile(
     ast_passes.push_back(std::make_unique<rellic::StructFieldRenamer>(
         dec_ctx, dic.GetIRTypeToDITypeMap()));
     pass_ast.Run();
+    
+    // EXCEPTION ANALYSIS: Analyze exception regions after AST generation
+    LOG(INFO) << "Checking exception flag: " << (options.enable_exception_try_catch ? "ENABLED" : "DISABLED");
+    if (options.enable_exception_try_catch) {
+      LOG(INFO) << "Exception handling is ENABLED, starting analysis...";
+      auto exception_pass = std::make_unique<rellic::ExceptionHandlingPass>(dec_ctx, options.enable_exception_try_catch);
+      // Analyze exception regions after AST generation when Clang declarations exist
+      LOG(INFO) << "Starting exception analysis...";
+      exception_pass->AnalyzeAllFunctionsWithExceptions(*module);
+      LOG(INFO) << "Exception analysis completed, found " << dec_ctx.exception_regions.GetTryRegions().size() << " try regions";
+      
+      // Also check what's in the exception regions
+      auto& try_regions = dec_ctx.exception_regions.GetTryRegions();
+      for (size_t i = 0; i < try_regions.size(); ++i) {
+        const auto& region = try_regions[i];
+        std::string landingpad_str;
+        llvm::raw_string_ostream landingpad_stream(landingpad_str);
+        region.landingpad_block->printAsOperand(landingpad_stream, false);
+        landingpad_stream.flush();
+        LOG(INFO) << "Try region " << i << ": landingpad " << landingpad_str 
+                  << ", " << region.blocks.size() << " try blocks, "
+                  << region.catch_handlers.size() << " catch handlers";
+      }
+      
+      // EXCEPTION AST TRANSFORMATION: Transform the AST based on the analyzed exception regions
+      LOG(INFO) << "Starting exception AST transformation...";
+      rellic::CompositeASTPass pass_exception_transform{dec_ctx};
+      auto& exception_transform_passes{pass_exception_transform.GetPasses()};
+      exception_transform_passes.push_back(std::make_unique<rellic::ExceptionASTTransform>(dec_ctx));
+      pass_exception_transform.Run();
+      LOG(INFO) << "Exception AST transformation completed";
+      
+      // RUN BOOLEAN SIMPLIFICATION AFTER EXCEPTION TRANSFORMATION
+      LOG(INFO) << "Running boolean simplification after exception transformation...";
+      rellic::CompositeASTPass pass_exception_cleanup{dec_ctx};
+      auto& exception_cleanup_passes{pass_exception_cleanup.GetPasses()};
+      exception_cleanup_passes.push_back(std::make_unique<rellic::BooleanSimplify>(dec_ctx));
+      exception_cleanup_passes.push_back(std::make_unique<rellic::Z3CondSimplify>(dec_ctx));
+      exception_cleanup_passes.push_back(std::make_unique<rellic::BooleanSimplify>(dec_ctx)); // Run again after Z3 simplification
+      
+      // Run cleanup passes multiple times until no more changes
+      int cleanup_iterations = 0;
+      while (pass_exception_cleanup.Run() && cleanup_iterations < 5) {
+        cleanup_iterations++;
+        LOG(INFO) << "Exception cleanup iteration " << cleanup_iterations;
+      }
+      LOG(INFO) << "Boolean simplification after exception transformation completed (" << cleanup_iterations << " iterations)";
+      
+      rellic::CompositeASTPass pass_post_exception_cleanup{dec_ctx};
+      auto& post_exception_passes{pass_post_exception_cleanup.GetPasses()};
+      // Now it's safe to aggressively eliminate if(0+0) patterns since catch blocks are formed
+      post_exception_passes.push_back(std::make_unique<rellic::DeadStmtElim>(dec_ctx, true));
+      pass_post_exception_cleanup.Run();
+      LOG(INFO) << "Aggressive dead statement elimination completed";
+      
+    } else {
+      LOG(INFO) << "Exception handling is DISABLED, skipping analysis";
+    }
 
     rellic::CompositeASTPass pass_cbr(dec_ctx);
     auto& cbr_passes{pass_cbr.GetPasses()};
 
     cbr_passes.push_back(std::make_unique<rellic::Z3CondSimplify>(dec_ctx));
+    cbr_passes.push_back(std::make_unique<rellic::BooleanSimplify>(dec_ctx));
     cbr_passes.push_back(std::make_unique<rellic::NestedCondProp>(dec_ctx));
 
     cbr_passes.push_back(std::make_unique<rellic::NestedScopeCombine>(dec_ctx));
 
     cbr_passes.push_back(std::make_unique<rellic::CondBasedRefine>(dec_ctx));
     cbr_passes.push_back(std::make_unique<rellic::ReachBasedRefine>(dec_ctx));
+    cbr_passes.push_back(std::make_unique<rellic::DeadStmtElim>(dec_ctx, true));
 
-    while (pass_cbr.Run()) {
-      ;
-    }
+    pass_cbr.Run();
 
     rellic::CompositeASTPass pass_loop{dec_ctx};
     auto& loop_passes{pass_loop.GetPasses()};
@@ -131,28 +195,40 @@ Result<DecompilationResult, DecompilationError> Decompile(
     loop_passes.push_back(
         std::make_unique<rellic::NestedScopeCombine>(dec_ctx));
 
-    while (pass_loop.Run()) {
-      ;
-    }
+    pass_loop.Run();
 
     rellic::CompositeASTPass pass_scope{dec_ctx};
     auto& scope_passes{pass_scope.GetPasses()};
     scope_passes.push_back(std::make_unique<rellic::Z3CondSimplify>(dec_ctx));
+    scope_passes.push_back(std::make_unique<rellic::BooleanSimplify>(dec_ctx));
     scope_passes.push_back(std::make_unique<rellic::NestedCondProp>(dec_ctx));
 
     scope_passes.push_back(
         std::make_unique<rellic::NestedScopeCombine>(dec_ctx));
 
-    while (pass_scope.Run()) {
-      ;
-    }
-
+    pass_scope.Run();
+    
     rellic::CompositeASTPass pass_ec{dec_ctx};
     auto& ec_passes{pass_ec.GetPasses()};
     ec_passes.push_back(std::make_unique<rellic::MaterializeConds>(dec_ctx));
     ec_passes.push_back(std::make_unique<rellic::ExprCombine>(dec_ctx));
 
     pass_ec.Run();
+    
+    // Run BooleanSimplify again after MaterializeConds to simplify 1U && expr patterns
+    rellic::CompositeASTPass pass_final_simplify{dec_ctx};
+    auto& final_simplify_passes{pass_final_simplify.GetPasses()};
+    final_simplify_passes.push_back(std::make_unique<rellic::BooleanSimplify>(dec_ctx));
+    
+    pass_final_simplify.Run();
+    
+    // FINAL AGGRESSIVE DEAD STATEMENT ELIMINATION
+    LOG(INFO) << "Running final aggressive dead statement elimination...";
+    rellic::CompositeASTPass pass_final_cleanup{dec_ctx};
+    auto& final_cleanup_passes{pass_final_cleanup.GetPasses()};
+    final_cleanup_passes.push_back(std::make_unique<rellic::DeadStmtElim>(dec_ctx, true));
+    pass_final_cleanup.Run();
+    LOG(INFO) << "Final aggressive dead statement elimination completed";
 
     DecompilationResult result{};
     result.ast = std::move(ast_unit);

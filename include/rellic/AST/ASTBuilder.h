@@ -301,6 +301,14 @@ class ASTBuilder {
   clang::BreakStmt *CreateBreak();
   // Return
   clang::ReturnStmt *CreateReturn(clang::Expr *retval = nullptr);
+  // Try statement  
+  clang::CXXTryStmt *CreateTry(clang::Stmt *try_block,
+                               llvm::ArrayRef<clang::Stmt *> handlers);
+  // Catch statement
+  clang::CXXCatchStmt *CreateCatch(clang::VarDecl *exception_var,
+                                   clang::Stmt *handler_block);
+  // Throw expression
+  clang::CXXThrowExpr *CreateThrow(clang::Expr *sub_expr = nullptr);
   // Typedef declaration
   clang::TypedefDecl *CreateTypedefDecl(clang::DeclContext *decl_ctx,
                                         clang::IdentifierInfo *id,
@@ -317,6 +325,14 @@ class ASTBuilder {
   clang::SwitchStmt *CreateSwitchStmt(clang::Expr *cond);
   clang::CaseStmt *CreateCaseStmt(clang::Expr *cond);
   clang::DefaultStmt *CreateDefaultStmt(clang::Stmt *body);
+  
+  // C++ Exception handling
+  clang::CXXTryStmt *CreateCXXTryStmt(clang::SourceLocation try_loc,
+                                     clang::CompoundStmt *try_block,
+                                     llvm::ArrayRef<clang::CXXCatchStmt*> handlers);
+  clang::CXXCatchStmt *CreateCXXCatchStmt(clang::SourceLocation catch_loc,
+                                         clang::VarDecl *exception_decl,
+                                         clang::Stmt *handler_block);
 
   // Creates a marker statement that looks like a comment in the output
   clang::CompoundStmt *CreateCommentMarker(const std::string &text);
@@ -362,6 +378,11 @@ class ASTBuilder {
     // For now, return nullptr as this requires more complex AST traversal
     return nullptr;
   }
+
+  // Exception handling
+  clang::CXXTemporaryObjectExpr *CreateTemporary(clang::QualType type, std::vector<clang::Expr*> args);
+  clang::CXXConstructExpr *CreateConstructExpr(std::vector<clang::Expr*> args);
+  clang::TypeSourceInfo *CreateTypeRef(std::string type_name);
 };
 
 }  // namespace rellic

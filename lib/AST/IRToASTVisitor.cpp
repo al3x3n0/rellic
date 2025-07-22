@@ -7,6 +7,7 @@
  */
 
 #include <clang/Basic/Builtins.h>
+#include <clang/AST/ExprCXX.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -162,6 +163,16 @@ clang::Expr *IRToASTVisitor::ConvertExpr(z3::expr expr) {
     // this is the way they obtain uses internally, but it's probably not
     // stable.
     return CreateOperandExpr(*(edge.first->op_end() - 3));
+  }
+
+  // Check for invoke instruction edges (exception handling)
+  if (dec_ctx.z3_invoke_edges_inv.find(hash) != dec_ctx.z3_invoke_edges_inv.end()) {
+    auto edge{dec_ctx.z3_invoke_edges_inv[hash]};
+    CHECK(edge.second) << "Inverse map should only be populated for invoke "
+                          "normal paths";
+    // For invoke instructions, the "normal" path represents successful execution
+    // We'll create a constant true expression to represent this
+    return ast.CreateTrue();
   }
 
   switch (expr.decl().decl_kind()) {
@@ -330,8 +341,21 @@ clang::Expr *ExprGen::CreateLiteralExpr(llvm::Constant *constant) {
     // Integers
     case llvm::Type::IntegerTyID: {
       if (llvm::isa<llvm::ConstantInt>(constant)) {
-        auto val{llvm::cast<llvm::ConstantInt>(constant)->getValue()};
-        result = ast.CreateIntLit(val);
+        auto const_int = llvm::cast<llvm::ConstantInt>(constant);
+        auto val = const_int->getValue();
+        
+        // Check if this is an i1 (boolean) type
+        if (l_type->isIntegerTy(1)) {
+          // Convert i1 constants to boolean literals
+          if (val == 1) {
+            result = ast.CreateTrue();
+          } else {
+            result = ast.CreateFalse();
+          }
+        } else {
+          // Regular integer literal for non-i1 types
+          result = ast.CreateIntLit(val);
+        }
       } else if (llvm::isa<llvm::UndefValue>(constant)) {
         result = ast.CreateUndefInteger(c_type);
       } else {
@@ -778,9 +802,41 @@ clang::Expr *ExprGen::visitInvokeInst(llvm::InvokeInst &inst) {
 clang::Expr *ExprGen::visitLandingPadInst(llvm::LandingPadInst &inst) {
   DLOG(INFO) << "visitLandingPadInst: " << LLVMThingToString(&inst);
   
-  // For now, return a null pointer expression representing the exception object
-  // This is a placeholder implementation that should be enhanced for proper
-  // exception handling support
+  // The landingpad instruction returns a { ptr, i32 } struct for exception handling
+  // Create a zero-initialized struct to match the expected type
+  auto type = inst.getType();
+  if (type->isStructTy()) {
+    // Create expressions for each field of the struct
+    std::vector<clang::Expr*> init_exprs;
+    
+    auto struct_type = llvm::cast<llvm::StructType>(type);
+    for (unsigned i = 0; i < struct_type->getNumElements(); ++i) {
+      auto elem_type = struct_type->getElementType(i);
+      if (elem_type->isPointerTy()) {
+        // Add null pointer for pointer fields
+        init_exprs.push_back(ast.CreateNull());
+      } else if (elem_type->isIntegerTy()) {
+        // Add zero for integer fields
+        auto int_type = llvm::cast<llvm::IntegerType>(elem_type);
+        auto zero = llvm::APInt(int_type->getBitWidth(), 0);
+        init_exprs.push_back(ast.CreateIntLit(zero));
+      } else {
+        // For other types, try to create a zero value
+        init_exprs.push_back(ast.CreateNull());
+      }
+    }
+    
+    // Create an init list expression for the struct
+    auto init_list = ast.CreateInitList(init_exprs);
+    
+    // Get the Clang type for the struct
+    auto clang_type = dec_ctx.GetQualType(type);
+    
+    // Create a compound literal expression
+    return ast.CreateCompoundLit(clang_type, init_list);
+  }
+  
+  // For non-struct types, return null as before
   return ast.CreateNull();
 }
 
@@ -1309,6 +1365,68 @@ clang::Stmt *StmtGen::visitStoreInst(llvm::StoreInst &inst) {
 }
 
 clang::Stmt *StmtGen::visitCallInst(llvm::CallInst &inst) {
+  // Check if this is a __cxa_throw call and convert to throw statement
+  if (auto *callee = inst.getCalledFunction()) {
+    if (callee->getName() == "__cxa_throw") {
+      LOG(INFO) << "Converting __cxa_throw to throw statement";
+      
+      // Extract the exception object from first argument
+      if (inst.arg_size() > 0) {
+        auto *exception_ptr = inst.getOperand(0);
+        
+        // Try to trace back to find the exception constructor call
+        clang::Expr* exception_expr = nullptr;
+        
+        // Look for the pattern: __cxa_allocate_exception followed by constructor call
+        if (auto *exception_var = llvm::dyn_cast<llvm::Value>(exception_ptr)) {
+          // Check if we have a constructor call stored for this exception
+          for (auto *user : exception_var->users()) {
+            if (auto *constructor_call = llvm::dyn_cast<llvm::CallInst>(user)) {
+              if (constructor_call->getCalledFunction()) {
+                std::string ctor_name = constructor_call->getCalledFunction()->getName().str();
+                DLOG(INFO) << "Found potential constructor call: " << ctor_name;
+                
+                // Check for common exception constructors
+                if (ctor_name.find("runtime_errorC1") != std::string::npos ||
+                    ctor_name.find("invalid_argumentC1") != std::string::npos ||
+                    ctor_name.find("overflow_errorC1") != std::string::npos) {
+                  
+                  // Extract the message argument (usually the second argument)
+                  if (constructor_call->arg_size() > 1) {
+                    auto *message_arg = expr_gen.CreateOperandExpr(constructor_call->getOperandUse(1));
+                    
+                    // Create the exception type name from the constructor
+                    std::string exception_type = "std::runtime_error";
+                    if (ctor_name.find("invalid_argument") != std::string::npos) {
+                      exception_type = "std::invalid_argument";
+                    } else if (ctor_name.find("overflow_error") != std::string::npos) {
+                      exception_type = "std::overflow_error";
+                    }
+                    
+                    // For exception construction, we'll use the message as a proxy
+                    // A complete implementation would need full type system support
+                    exception_expr = message_arg;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        // If we couldn't reconstruct the exception, use the raw pointer
+        if (!exception_expr) {
+          exception_expr = expr_gen.CreateOperandExpr(inst.getOperandUse(0));
+        }
+        
+        auto* throw_expr = ast.CreateThrow(exception_expr);
+        LOG(INFO) << "Created throw expression for __cxa_throw";
+        return static_cast<clang::Stmt*>(throw_expr);
+      }
+    }
+  }
+  
+  // Regular call handling
   auto &var{dec_ctx.value_decls[&inst]};
   auto expr{expr_gen.visit(inst)};
   if (var) {
@@ -1352,16 +1470,25 @@ clang::Stmt *StmtGen::visitPHINode(llvm::PHINode &inst) { return nullptr; }
 clang::Stmt *StmtGen::visitLandingPadInst(llvm::LandingPadInst &inst) {
   DLOG(INFO) << "visitLandingPadInst: " << LLVMThingToString(&inst);
   
-  // For now, we'll create a simple variable assignment that represents
-  // the exception object. This is a basic implementation that can be
-  // enhanced later to generate proper try-catch blocks.
+  // Landingpad instructions are part of exception handling
+  // They appear at the beginning of catch blocks
+  auto* block = inst.getParent();
+  LOG(INFO) << "LandingPad in block: " << (block->hasName() ? block->getName().str() : "unnamed");
+  
+  // Create the variable assignment as before, but mark it as exception-related
   auto &var{dec_ctx.value_decls[&inst]};
   if (var) {
-    // Create a call to a dummy exception handler function
-    // This will be replaced with proper exception handling later
-    auto exc_type = ast_ctx.VoidPtrTy;
-    auto null_expr = ast.CreateNull();
-    return ast.CreateAssign(ast.CreateDeclRef(var), null_expr);
+    // Use the expression generator to create the proper struct initialization
+    auto landingpad_expr = expr_gen.visitLandingPadInst(inst);
+    auto* assign_stmt = ast.CreateAssign(ast.CreateDeclRef(var), landingpad_expr);
+    
+    // Mark this statement as part of exception handling
+    dec_ctx.stmt_provenance[assign_stmt] = &inst;
+    
+    // Store the block association
+    dec_ctx.stmt_to_block[assign_stmt] = block;
+    
+    return assign_stmt;
   }
   return nullptr;
 }
@@ -1381,15 +1508,12 @@ clang::Stmt *StmtGen::visitInvokeInst(llvm::InvokeInst &inst) {
   // Invoke is like a call instruction but with exception handling
   // For now, we generate the call and ignore exception handling edges
   auto &var{dec_ctx.value_decls[&inst]};
+  auto expr{expr_gen.visitInvokeInst(inst)};
   if (var && !inst.getType()->isVoidTy()) {
-    auto expr{expr_gen.visitInvokeInst(inst)};
     return ast.CreateAssign(ast.CreateDeclRef(var), expr);
-  } else if (inst.getType()->isVoidTy()) {
-    // For void invoke, just create the expression statement
-    auto expr{expr_gen.visitInvokeInst(inst)};
-    return expr;
   }
-  return nullptr;
+  // For void invoke instructions, return the expression directly (like visitCallInst does)
+  return expr;
 }
 
 clang::Stmt *StmtGen::visitInstruction(llvm::Instruction &inst) {
@@ -1430,11 +1554,19 @@ void IRToASTVisitor::VisitBasicBlock(llvm::BasicBlock &block,
                                      std::vector<clang::Stmt *> &stmts) {
   ExprGen expr_gen{dec_ctx};
   StmtGen stmt_gen{expr_gen, dec_ctx};
+  
+  // Track that we're processing this block
+  LOG(INFO) << "VisitBasicBlock: " << (block.hasName() ? block.getName().str() : "unnamed") 
+            << " with " << block.size() << " instructions";
+  
   for (auto &inst : block) {
     auto stmt{stmt_gen.visit(inst)};
     if (stmt) {
       stmts.push_back(stmt);
       dec_ctx.stmt_provenance[stmt] = &inst;
+      
+      // Also track which block this statement came from
+      dec_ctx.stmt_to_block[stmt] = &block;
     }
   }
 
@@ -1443,7 +1575,11 @@ void IRToASTVisitor::VisitBasicBlock(llvm::BasicBlock &block,
     auto use{*it};
     auto var{dec_ctx.value_decls[use->getUser()]};
     auto expr{expr_gen.CreateOperandExpr(*use)};
-    stmts.push_back(ast.CreateAssign(ast.CreateDeclRef(var), expr));
+    auto* assign_stmt = ast.CreateAssign(ast.CreateDeclRef(var), expr);
+    stmts.push_back(assign_stmt);
+    
+    // Track this assignment's source block too
+    dec_ctx.stmt_to_block[assign_stmt] = &block;
   }
 }
 

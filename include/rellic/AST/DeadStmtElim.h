@@ -18,11 +18,14 @@ namespace rellic {
  * This pass eliminates statements that have no effect
  */
 class DeadStmtElim : public TransformVisitor<DeadStmtElim> {
+ private:
+  bool eliminate_zero_patterns;  // Flag to enable elimination of 0+0 patterns
+  
  protected:
   void RunImpl() override;
 
  public:
-  DeadStmtElim(DecompilationContext &dec_ctx);
+  DeadStmtElim(DecompilationContext &dec_ctx, bool eliminate_zero_patterns = false);
 
   bool VisitIfStmt(clang::IfStmt *ifstmt);
   bool VisitCompoundStmt(clang::CompoundStmt *compound);

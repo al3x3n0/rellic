@@ -22,10 +22,14 @@ set(include_dir "${PROJECT_SOURCE_DIR}/include/${PROJECT_NAME}")
 
 set(AST_HEADERS
   "${include_dir}/AST/ASTBuilder.h"
+  "${include_dir}/AST/BooleanSimplify.h"
   "${include_dir}/AST/CXXToCDecl.h"
   "${include_dir}/AST/CondBasedRefine.h"
   "${include_dir}/AST/DeadStmtElim.h"
   "${include_dir}/AST/DebugInfoCollector.h"
+  "${include_dir}/AST/ExceptionHandlingPass.h"
+  "${include_dir}/AST/ExceptionRegionInfo.h"
+  "${include_dir}/AST/ExceptionASTTransform.h"
   "${include_dir}/AST/ExprCombine.h"
   "${include_dir}/AST/GenerateAST.h"
   "${include_dir}/AST/IRToASTVisitor.h"
@@ -62,11 +66,15 @@ set(public_HEADERS
 
 set(AST_SOURCES
   AST/ASTBuilder.cpp
+  AST/BooleanSimplify.cpp
   AST/CXXToCDecl.cpp
   AST/InferenceRule.cpp
   AST/DeadStmtElim.cpp
   AST/DebugInfoCollector.cpp
   AST/CondBasedRefine.cpp
+  AST/ExceptionHandlingPass.cpp
+  AST/ExceptionRegionInfo.cpp
+  AST/ExceptionASTTransform.cpp
   AST/ExprCombine.cpp
   AST/GenerateAST.cpp
   AST/IRToASTVisitor.cpp

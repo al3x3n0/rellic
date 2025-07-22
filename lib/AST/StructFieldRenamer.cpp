@@ -23,7 +23,13 @@ StructFieldRenamer::StructFieldRenamer(DecompilationContext &dec_ctx,
 
 bool StructFieldRenamer::VisitRecordDecl(clang::RecordDecl *decl) {
   auto type{decls[decl]};
-  CHECK(type) << "Type information not present for declaration";
+  if (!type) {
+    // Skip struct declarations that don't have corresponding LLVM types
+    // This can happen for structs created by other passes or for debug info
+    DLOG(INFO) << "Skipping struct without LLVM type info: " 
+               << decl->getNameAsString();
+    return !Stopped();
+  }
 
   auto di{types[type]};
   if (!di) {

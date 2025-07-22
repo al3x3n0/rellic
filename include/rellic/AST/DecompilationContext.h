@@ -17,9 +17,13 @@
 #include <unordered_map>
 
 #include "rellic/AST/ASTBuilder.h"
+#include "rellic/AST/ExceptionRegionInfo.h"
 #include "rellic/AST/TypeProvider.h"
 
 namespace rellic {
+
+// Forward declaration
+struct ExceptionCatchHandler;
 
 struct DecompilationContext {
   using StmtToIRMap = std::unordered_map<clang::Stmt *, llvm::Value *>;
@@ -49,6 +53,7 @@ struct DecompilationContext {
   using BBEdge = std::pair<llvm::BasicBlock *, llvm::BasicBlock *>;
   using BrEdge = std::pair<llvm::BranchInst *, bool>;
   using SwEdge = std::pair<llvm::SwitchInst *, llvm::ConstantInt *>;
+  using InvokeEdge = std::pair<llvm::InvokeInst *, bool>;
 
   DecompilationContext(clang::ASTUnit &ast_unit);
 
@@ -102,12 +107,33 @@ struct DecompilationContext {
   std::unordered_map<llvm::SwitchInst *, unsigned> z3_sw_vars;
   std::unordered_map<unsigned, llvm::SwitchInst *> z3_sw_vars_inv;
   std::map<SwEdge, unsigned> z3_sw_edges;
+  
+  std::unordered_map<unsigned, InvokeEdge> z3_invoke_edges_inv;
+  std::map<InvokeEdge, unsigned> z3_invoke_edges;
 
   std::map<BBEdge, unsigned> z3_edges;
   std::unordered_map<llvm::BasicBlock *, unsigned> reaching_conds;
 
   size_t num_literal_structs = 0;
   size_t num_declared_structs = 0;
+
+  // Exception region analysis results
+  ExceptionRegionInfo exception_regions;
+  
+  // Map statements to their exception context
+  // Key: Clang Stmt*, Value: Exception context (try block, catch handler type, etc.)
+  struct ExceptionContext {
+    enum Type { NONE, TRY_BLOCK, CATCH_HANDLER } type = NONE;
+    std::string exception_type;  // For catch handlers, the exception type being caught
+    llvm::BasicBlock* landing_pad = nullptr;  // Associated landing pad
+  };
+  std::unordered_map<clang::Stmt*, ExceptionContext> stmt_exception_context;
+  
+  // Map basic blocks to their exception handler info
+  std::unordered_map<llvm::BasicBlock*, const ExceptionCatchHandler*> block_exception_info;
+  
+  // Map statements to their source basic block (improved provenance)
+  std::unordered_map<clang::Stmt*, llvm::BasicBlock*> stmt_to_block;
 
   // Inserts an expression into z3_exprs and returns its index
   unsigned InsertZExpr(const z3::expr &e);

@@ -367,6 +367,18 @@ clang::BinaryOperator *ASTBuilder::CreateBinaryOp(clang::BinaryOperatorKind opc,
   return er.getAs<clang::BinaryOperator>();
 }
 
+clang::BinaryOperator *ASTBuilder::CreateBinaryOperator(clang::Expr *lhs,
+                                                       clang::Expr *rhs,
+                                                       clang::BinaryOperator::Opcode opc,
+                                                       clang::QualType res_type) {
+  // Convert from BinaryOperator::Opcode to BinaryOperatorKind
+  auto kind = static_cast<clang::BinaryOperatorKind>(opc);
+  
+  // Use the existing CreateBinaryOp implementation which handles
+  // parentheses and uses Sema to create the operator with proper type checking
+  return CreateBinaryOp(kind, lhs, rhs);
+}
+
 clang::ConditionalOperator *ASTBuilder::CreateConditional(clang::Expr *cond,
                                                           clang::Expr *lhs,
                                                           clang::Expr *rhs) {
@@ -462,6 +474,7 @@ clang::CompoundLiteralExpr *ASTBuilder::CreateCompoundLit(clang::QualType type,
   return er.getAs<clang::CompoundLiteralExpr>();
 }
 
+
 clang::IfStmt *ASTBuilder::CreateIf(clang::Expr *cond, clang::Stmt *then_val,
                                     clang::Stmt *else_val) {
   CHECK(cond && then_val) << "Should not be null in CreateIf.";
@@ -519,6 +532,98 @@ clang::ReturnStmt *ASTBuilder::CreateReturn(clang::Expr *retval) {
   // return sr.getAs<clang::ReturnStmt>();
   return clang::ReturnStmt::Create(ctx, clang::SourceLocation(), retval,
                                    nullptr);
+}
+
+clang::CXXTryStmt *ASTBuilder::CreateTry(clang::Stmt *try_block,
+                                         llvm::ArrayRef<clang::Stmt *> handlers) {
+  return clang::CXXTryStmt::Create(ctx, clang::SourceLocation(), try_block,
+                                   handlers);
+}
+
+clang::CXXCatchStmt *ASTBuilder::CreateCatch(clang::VarDecl *exception_var,
+                                             clang::Stmt *handler_block) {
+  return new (ctx) clang::CXXCatchStmt(clang::SourceLocation(), exception_var,
+                                       handler_block);
+}
+
+clang::CXXThrowExpr *ASTBuilder::CreateThrow(clang::Expr *expr) {
+  return new (ctx) clang::CXXThrowExpr(
+    expr,
+    ctx.VoidTy,
+    clang::SourceLocation(),
+    false  // Does not throw any exceptions
+  );
+}
+
+clang::CXXTemporaryObjectExpr* ASTBuilder::CreateTemporary(
+    clang::QualType type,
+    std::vector<clang::Expr*> args) {
+  
+  // Create constructor declaration
+  auto* record = type->getAsCXXRecordDecl();
+  if (!record) {
+    THROW() << "Type is not a C++ class/struct";
+  }
+  
+  // Find the constructor that matches our arguments
+  clang::CXXConstructorDecl* ctor = nullptr;
+  for (auto* method : record->ctors()) {
+    if (method->getNumParams() == args.size()) {
+      ctor = method;
+      break;
+    }
+  }
+  
+  if (!ctor) {
+    THROW() << "No matching constructor found";
+  }
+  
+  // Create the temporary object expression
+  auto type_info = ctx.getTrivialTypeSourceInfo(type, clang::SourceLocation());
+  
+  return clang::CXXTemporaryObjectExpr::Create(
+    ctx,
+    ctor,
+    type,
+    type_info,
+    args,
+    clang::SourceRange(),
+    false,  // Had multiple candidates
+    false,  // List initialization  
+    false,  // Std initializer list
+    false   // Zero initialization
+  );
+}
+
+clang::CXXConstructExpr* ASTBuilder::CreateConstructExpr(
+    std::vector<clang::Expr*> args) {
+  
+  // This function requires a specific type context which we don't have here
+  // The caller should use CreateTemporary with a proper type instead
+  THROW() << "CreateConstructExpr requires type context - use CreateTemporary instead";
+  return nullptr;  // Unreachable, but satisfies compiler
+}
+
+clang::TypeSourceInfo* ASTBuilder::CreateTypeRef(std::string type_name) {
+  // Create a type reference for a named type
+  // This creates an identifier type that will be resolved later
+  auto id = CreateIdentifier(type_name);
+  
+  // For C++ exception types, we need to create proper record types
+  clang::QualType type;
+  if (type_name.find("std::") == 0) {
+    // Create a CXXRecordDecl for the standard library type
+    auto record_decl = clang::CXXRecordDecl::Create(
+        ctx, clang::TTK_Class, ctx.getTranslationUnitDecl(),
+        clang::SourceLocation(), clang::SourceLocation(), id);
+    type = ctx.getRecordType(record_decl);
+  } else {
+    // For other types, create a typedef type
+    auto typedef_decl = CreateTypedefDecl(ctx.getTranslationUnitDecl(), id, ctx.IntTy);
+    type = ctx.getTypedefType(typedef_decl);
+  }
+  
+  return ctx.getTrivialTypeSourceInfo(type, clang::SourceLocation());
 }
 
 clang::TypedefDecl *ASTBuilder::CreateTypedefDecl(clang::DeclContext *decl_ctx,
@@ -584,6 +689,24 @@ clang::CompoundStmt *ASTBuilder::CreateCommentMarker(const std::string &text) {
   // Wrap in a compound statement
   std::vector<clang::Stmt *> stmts = {call};
   return CreateCompoundStmt(stmts);
+}
+
+clang::CXXTryStmt *ASTBuilder::CreateCXXTryStmt(clang::SourceLocation try_loc,
+                                               clang::CompoundStmt *try_block,
+                                               llvm::ArrayRef<clang::CXXCatchStmt*> handlers) {
+  // Convert CXXCatchStmt* to Stmt* for the Create function
+  std::vector<clang::Stmt*> stmt_handlers;
+  stmt_handlers.reserve(handlers.size());
+  for (auto *handler : handlers) {
+    stmt_handlers.push_back(handler);
+  }
+  return clang::CXXTryStmt::Create(ctx, try_loc, try_block, stmt_handlers);
+}
+
+clang::CXXCatchStmt *ASTBuilder::CreateCXXCatchStmt(clang::SourceLocation catch_loc,
+                                                   clang::VarDecl *exception_decl,
+                                                   clang::Stmt *handler_block) {
+  return new (ctx) clang::CXXCatchStmt(catch_loc, exception_decl, handler_block);
 }
 
 }  // namespace rellic

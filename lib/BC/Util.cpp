@@ -31,6 +31,13 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/LowerSwitch.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Scalar/DCE.h>
+#include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/SCCP.h>
+#include <llvm/Transforms/Scalar/JumpThreading.h>
 
 #include <unordered_map>
 
@@ -443,6 +450,71 @@ void ConvertArrayArguments(llvm::Module &m) {
   }
 
   CHECK(VerifyModule(&m)) << "Transformation broke module correctness";
+}
+
+void SimplifyControlFlowForExceptions(llvm::Module &module) {
+  LOG(INFO) << "Running enhanced control flow simplification for exception handling";
+  
+  llvm::PassBuilder pb;
+  llvm::ModulePassManager mpm;
+  llvm::ModuleAnalysisManager mam;
+  llvm::LoopAnalysisManager lam;
+  llvm::CGSCCAnalysisManager cam;
+  llvm::FunctionAnalysisManager fam;
+
+  pb.registerFunctionAnalyses(fam);
+  pb.registerModuleAnalyses(mam);
+  pb.registerCGSCCAnalyses(cam);
+  pb.registerLoopAnalyses(lam);
+  pb.crossRegisterProxies(lam, fam, cam, mam);
+
+  // Create aggressive simplification pipeline
+  llvm::FunctionPassManager fpm;
+  
+  // Multiple rounds of aggressive simplification
+  for (int round = 0; round < 3; round++) {
+    // Simplify control flow
+    fpm.addPass(llvm::SimplifyCFGPass());
+    
+    // Combine instructions to reduce complexity
+    fpm.addPass(llvm::InstCombinePass());
+    
+    // Dead code elimination
+    fpm.addPass(llvm::DCEPass());
+    fpm.addPass(llvm::ADCEPass());
+    
+    // Value propagation and redundancy elimination
+    fpm.addPass(llvm::GVNPass());
+    fpm.addPass(llvm::SCCPPass());
+    
+    // Jump threading to simplify conditional branches
+    fpm.addPass(llvm::JumpThreadingPass());
+    
+    // More aggressive CFG simplification
+    llvm::SimplifyCFGOptions cfg_opts;
+    cfg_opts.BonusInstThreshold = 2;  // More aggressive
+    cfg_opts.forwardSwitchCondToPhi(true);
+    cfg_opts.convertSwitchToLookupTable(true);
+    cfg_opts.needCanonicalLoops(false);
+    cfg_opts.hoistCommonInsts(true);
+    cfg_opts.sinkCommonInsts(true);
+    fpm.addPass(llvm::SimplifyCFGPass(cfg_opts));
+  }
+  
+  // Final cleanup round
+  fpm.addPass(llvm::InstCombinePass());
+  fpm.addPass(llvm::SimplifyCFGPass());
+
+  mpm.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+  mpm.run(module, mam);
+
+  mam.clear();
+  fam.clear();
+  cam.clear();
+  lam.clear();
+  
+  CHECK(VerifyModule(&module)) << "Exception control flow simplification broke module correctness";
+  LOG(INFO) << "Enhanced control flow simplification completed";
 }
 
 }  // namespace rellic

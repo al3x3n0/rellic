@@ -9,6 +9,8 @@
 #include "rellic/AST/GenerateAST.h"
 
 #include <clang/AST/Expr.h>
+#include <clang/AST/ExprCXX.h>
+#include <clang/AST/StmtCXX.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <llvm/ADT/DepthFirstIterator.h>
@@ -26,6 +28,8 @@
 #include <vector>
 
 #include "rellic/AST/ASTBuilder.h"
+#include "rellic/AST/DecompilationContext.h"
+#include "rellic/AST/ExceptionRegionInfo.h"
 #include "rellic/AST/Util.h"
 #include "rellic/BC/Util.h"
 #include "rellic/Exception.h"
@@ -214,6 +218,28 @@ unsigned GenerateAST::GetOrCreateEdgeForSwitch(llvm::SwitchInst *inst,
   return idx;
 }
 
+unsigned GenerateAST::GetOrCreateEdgeForInvoke(llvm::InvokeInst *inst, bool normal) {
+  if (dec_ctx.z3_invoke_edges.find({inst, normal}) != dec_ctx.z3_invoke_edges.end()) {
+    return dec_ctx.z3_invoke_edges[{inst, normal}];
+  }
+
+  if (normal) {
+    // This is the normal return path, so create a variable that is true
+    // when the invoke returns normally (no exception)
+    auto name{GetName(inst) + "_normal"};
+    auto edge{dec_ctx.z3_ctx.bool_const(name.c_str())};
+    dec_ctx.z3_invoke_edges[{inst, normal}] = dec_ctx.InsertZExpr(edge);
+    dec_ctx.z3_invoke_edges_inv[edge.id()] = {inst, true};
+  } else {
+    // This is the exception path, so create an expression that is true
+    // when the invoke throws an exception (complement of normal path)
+    auto edge{!(ToExpr(GetOrCreateEdgeForInvoke(inst, true)))};
+    dec_ctx.z3_invoke_edges[{inst, normal}] = dec_ctx.InsertZExpr(edge);
+  }
+
+  return dec_ctx.z3_invoke_edges[{inst, normal}];
+}
+
 unsigned GenerateAST::GetOrCreateEdgeCond(llvm::BasicBlock *from,
                                           llvm::BasicBlock *to) {
   if (dec_ctx.z3_edges.find({from, to}) != dec_ctx.z3_edges.end()) {
@@ -251,8 +277,17 @@ unsigned GenerateAST::GetOrCreateEdgeCond(llvm::BasicBlock *from,
     // Returns
     case llvm::Instruction::Ret:
       break;
-    // Exceptions
-    case llvm::Instruction::Invoke:
+    // Invoke - function call with exception handling
+    case llvm::Instruction::Invoke: {
+      auto invoke = llvm::cast<llvm::InvokeInst>(term);
+      // Check if 'to' is the normal destination or the exception destination
+      if (to == invoke->getNormalDest()) {
+        result = ToExpr(GetOrCreateEdgeForInvoke(invoke, true));
+      } else if (to == invoke->getUnwindDest()) {
+        result = ToExpr(GetOrCreateEdgeForInvoke(invoke, false));
+      }
+    } break;
+    // Other exception terminators
     case llvm::Instruction::Resume:
     case llvm::Instruction::CatchSwitch:
     case llvm::Instruction::CatchRet:
@@ -312,6 +347,13 @@ void GenerateAST::CreateReachingCond(llvm::BasicBlock *block) {
 }
 
 StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
+  // Check cache first to prevent duplication
+  auto cache_it = cached_block_stmts.find(block);
+  if (cache_it != cached_block_stmts.end()) {
+    LOG(INFO) << "Returning cached statements for block " << block->getName().str();
+    return cache_it->second;
+  }
+  
   StmtVec result;
   
   // Use a sophisticated naming scheme based on IR characteristics
@@ -357,8 +399,40 @@ StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
   // printf("[DEBUG] BB '%s' from function '%s'\n", 
   //        block_name.c_str(), block->getParent()->getName().str().c_str()); fflush(stdout);
   
-  // Visit the basic block using IRToASTVisitor
+  // Check if the block contains a landingpad instruction for debugging
+  for (auto &inst : *block) {
+    if (llvm::isa<llvm::LandingPadInst>(&inst)) {
+      LOG(INFO) << "Block " << block_name << " contains landingpad instruction";
+      break;
+    }
+  }
+  
+  // Check if this block is an exception handler block
+  bool is_exception_handler = false;
+  for (const auto& exc_region : dec_ctx.exception_regions.GetTryRegions()) {
+    // Check if this block is in any handler's blocks
+    for (const auto& handler : exc_region.catch_handlers) {
+      if (handler.blocks.count(block)) {
+        is_exception_handler = true;
+        LOG(INFO) << "Block " << block_name << " is an exception handler block";
+        break;
+      }
+    }
+    if (is_exception_handler) break;
+  }
+  
+  // Generate statements for all blocks, including exception handler blocks
+  // Exception handler blocks need their statements generated so ExceptionASTTransform can find them
   ast_gen.VisitBasicBlock(*block, result);
+  
+  // For exception handler blocks, don't include them in normal control flow
+  // but ensure their statements are available for ExceptionASTTransform
+  if (is_exception_handler) {
+    LOG(INFO) << "Generated " << result.size() << " statements for exception handler block " << block_name;
+    // The statements will be used by ExceptionASTTransform, not included in normal flow
+    // Clear the result so these statements don't appear in the main function body
+    result.clear();
+  }
   
   // Insert a BB marker at the beginning of the block
   // This will appear as a comment in the output
@@ -384,6 +458,9 @@ StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
   
   // No need for line tracking with hash-based naming
   
+  // Cache the result before returning to prevent duplication
+  cached_block_stmts[block] = result;
+  
   return result;
 }
 
@@ -396,6 +473,34 @@ StmtVec GenerateAST::CreateRegionStmts(llvm::Region *region) {
     if (!subregion && !IsRegionBlock(region, block)) {
       continue;
     }
+    
+    // Skip blocks that have been marked as processed (exception handler blocks)
+    if (this->block_stmts.count(block) && this->block_stmts[block] == nullptr) {
+      LOG(INFO) << "Skipping already processed block in CreateRegionStmts";
+      continue;
+    }
+    
+    // Check if this block is an exception handler block
+    bool is_exception_handler = false;
+    for (const auto& exc_region : dec_ctx.exception_regions.GetTryRegions()) {
+      // Check if this block is in any handler's blocks
+      for (const auto& handler : exc_region.catch_handlers) {
+        if (handler.blocks.count(block)) {
+          is_exception_handler = true;
+          LOG(INFO) << "Block " << block->getName().str() << " is an exception handler block";
+          break;
+        }
+      }
+      if (is_exception_handler) break;
+    }
+    
+    // Skip exception handler blocks - they will be processed by ExceptionASTTransform
+    if (is_exception_handler) {
+      LOG(INFO) << "Skipping exception handler block " << block->getName().str() 
+                << " in CreateRegionStmts to prevent wrapping in if(0U)";
+      continue;
+    }
+    
     // If the block is a head of a subregion, get the compound statement of
     // the subregion otherwise create a new compound and gate it behind a
     // reaching condition.
@@ -413,6 +518,8 @@ StmtVec GenerateAST::CreateRegionStmts(llvm::Region *region) {
     block_stmts[block] = ast.CreateIf(dec_ctx.marker_expr, compound);
     dec_ctx.conds[block_stmts[block]] =
         dec_ctx.InsertZExpr(dec_ctx.z3_exprs[z_expr]);
+    // Map the if statement to its source block for provenance tracking
+    dec_ctx.stmt_to_block[block_stmts[block]] = block;
     // Store the compound
     result.push_back(block_stmts[block]);
   }
@@ -536,6 +643,141 @@ clang::CompoundStmt *GenerateAST::StructureCyclicRegion(llvm::Region *region) {
   return ast.CreateCompoundStmt(region_body);
 }
 
+clang::CompoundStmt *GenerateAST::StructureExceptionRegion(llvm::Region *region, 
+                                                           const TryRegion* exc_region) {
+  LOG(INFO) << "Structuring exception region with " << exc_region->blocks.size() 
+            << " try blocks and " << exc_region->catch_handlers.size() << " catch handlers";
+  
+  // Collect statements for the try block
+  StmtVec try_stmts;
+  
+  // Process all blocks in the try region
+  for (auto* try_block : exc_region->blocks) {
+    // Only process blocks that are in this LLVM region
+    if (!IsRegionBlock(region, try_block)) {
+      continue;
+    }
+    
+    auto block_stmts = CreateBasicBlockStmts(try_block);
+    try_stmts.insert(try_stmts.end(), block_stmts.begin(), block_stmts.end());
+    
+    // Mark these blocks as processed so they don't get processed again
+    this->block_stmts[try_block] = nullptr;
+  }
+  
+  // Create catch handlers
+  std::vector<clang::CXXCatchStmt*> catch_handlers;
+  
+  for (const auto& handler : exc_region->catch_handlers) {
+    LOG(INFO) << "Processing catch handler for " << handler.exception_type_name 
+              << " with " << handler.blocks.size() << " blocks";
+    
+    // Collect statements from all handler blocks
+    StmtVec handler_stmts;
+    
+    for (auto* handler_block : handler.blocks) {
+      // Only process blocks that are in this LLVM region
+      if (!IsRegionBlock(region, handler_block)) {
+        continue;
+      }
+      
+      auto block_stmts = CreateBasicBlockStmts(handler_block);
+      handler_stmts.insert(handler_stmts.end(), block_stmts.begin(), block_stmts.end());
+      
+      // Mark these blocks as processed
+      this->block_stmts[handler_block] = nullptr;
+    }
+    
+    // Create the catch handler body
+    auto catch_body = ast.CreateCompoundStmt(handler_stmts);
+    
+    // Create exception variable declaration
+    clang::VarDecl* exception_var = nullptr;
+    if (!handler.is_catch_all) {
+      // Extract the exception type name
+      std::string type_name = handler.exception_type_name;
+      
+      // Remove "class " prefix if present
+      if (type_name.find("class ") == 0) {
+        type_name = type_name.substr(6);
+      }
+      
+      // Create a simple name from the type
+      std::string var_name = type_name;
+      std::replace(var_name.begin(), var_name.end(), ':', '_');
+      if (var_name.find("std__") == 0) {
+        var_name = var_name.substr(5);
+      }
+      
+      // For now, use void* as the exception type
+      // TODO: Create proper exception type based on handler.exception_type_name
+      auto exception_type = dec_ctx.ast_ctx.getPointerType(dec_ctx.ast_ctx.VoidTy);
+      
+      // Get the function declaration context
+      llvm::Function* llvm_func = nullptr;
+      for (auto& [val, decl] : dec_ctx.value_decls) {
+        if (auto* func = llvm::dyn_cast<llvm::Function>(val)) {
+          if (func == region->getEntry()->getParent()) {
+            llvm_func = func;
+            break;
+          }
+        }
+      }
+      
+      if (llvm_func) {
+        auto* func_decl = llvm::cast<clang::FunctionDecl>(dec_ctx.value_decls[llvm_func]);
+        exception_var = ast.CreateVarDecl(func_decl, exception_type, var_name);
+      }
+    }
+    
+    // Create the catch statement
+    auto* catch_stmt = ast.CreateCXXCatchStmt(
+        clang::SourceLocation(), exception_var, catch_body);
+    catch_handlers.push_back(catch_stmt);
+  }
+  
+  // Create the try statement
+  auto try_body = ast.CreateCompoundStmt(try_stmts);
+  auto* try_catch = ast.CreateCXXTryStmt(
+      clang::SourceLocation(), try_body,
+      llvm::ArrayRef<clang::CXXCatchStmt*>(catch_handlers));
+  
+  // Process any remaining blocks in the region that aren't part of exception handling
+  StmtVec remaining_stmts;
+  remaining_stmts.push_back(try_catch);
+  
+  for (auto block : rpo_walk) {
+    // Skip if not in this region
+    if (!IsRegionBlock(region, block)) {
+      continue;
+    }
+    
+    // Skip if already processed as part of exception handling
+    if (block_stmts.count(block) && block_stmts[block] == nullptr) {
+      continue;
+    }
+    
+    // Skip subregions
+    if (GetSubregion(region, block)) {
+      continue;
+    }
+    
+    // Process this block normally
+    auto z_expr{GetReachingCond(block)};
+    if (block_stmts.count(block) && block_stmts[block]) {
+      remaining_stmts.push_back(block_stmts[block]);
+    } else {
+      auto block_body = CreateBasicBlockStmts(block);
+      auto compound = ast.CreateCompoundStmt(block_body);
+      auto if_stmt = ast.CreateIf(dec_ctx.marker_expr, compound);
+      dec_ctx.conds[if_stmt] = dec_ctx.InsertZExpr(dec_ctx.z3_exprs[z_expr]);
+      remaining_stmts.push_back(if_stmt);
+    }
+  }
+  
+  return ast.CreateCompoundStmt(remaining_stmts);
+}
+
 clang::CompoundStmt *GenerateAST::StructureSwitchRegion(llvm::Region *region) {
   DLOG(INFO) << "Region " << GetRegionNameStr(region)
              << " has a switch instruction";
@@ -591,6 +833,46 @@ clang::CompoundStmt *GenerateAST::StructureRegion(llvm::Region *region) {
                  << "; returning current region instead";
     return region_stmt;
   }
+  
+  // Check if this region contains exception handling
+  bool contains_exception_handling = false;
+  const TryRegion* exception_region = nullptr;
+  
+  // Check all blocks in this region to see if any are part of exception regions
+  for (auto* block : region->blocks()) {
+    // Check if this block is part of any exception region
+    for (const auto& exc_region : dec_ctx.exception_regions.GetTryRegions()) {
+      // Check if it's a try block
+      if (exc_region.blocks.count(block)) {
+        contains_exception_handling = true;
+        exception_region = &exc_region;
+        LOG(INFO) << "Region contains exception try block";
+        break;
+      }
+      
+      // Check if it's a catch handler block
+      for (const auto& handler : exc_region.catch_handlers) {
+        if (handler.blocks.count(block)) {
+          contains_exception_handling = true;
+          exception_region = &exc_region;
+          LOG(INFO) << "Region contains exception catch handler";
+          break;
+        }
+      }
+      
+      if (contains_exception_handling) break;
+    }
+    
+    if (contains_exception_handling) break;
+  }
+  
+  // If this region contains exception handling, structure it specially
+  if (contains_exception_handling && exception_region) {
+    LOG(INFO) << "Structuring exception handling region";
+    region_stmt = StructureExceptionRegion(region, exception_region);
+    return region_stmt;
+  }
+  
   bool is_cyclic{loops->isLoopHeader(region->getEntry())};
   if (llvm::isa<llvm::SwitchInst>(region->getEntry()->getTerminator()) &&
       !GetSubregion(region, region->getEntry()) && !is_cyclic) {
@@ -642,6 +924,22 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
   domtree = &FAM.getResult<llvm::DominatorTreeAnalysis>(func);
   regions = &FAM.getResult<llvm::RegionInfoAnalysis>(func);
   loops = &FAM.getResult<llvm::LoopAnalysis>(func);
+  
+  // Check if this function has exception regions
+  bool has_exceptions = false;
+  for (const auto& region : dec_ctx.exception_regions.GetTryRegions()) {
+    if (!region.blocks.empty()) {
+      auto* first_block = *region.blocks.begin();
+      if (first_block->getParent() == &func) {
+        has_exceptions = true;
+        break;
+      }
+    }
+  }
+  
+  if (has_exceptions) {
+    LOG(INFO) << "Function " << func.getName().str() << " has exception handling regions";
+  }
 
   // Get blocks in reverse post-order for reaching conditions
   rpo_walk.clear();
@@ -651,7 +949,34 @@ GenerateAST::Result GenerateAST::run(llvm::Function &func,
 
   // Process each block once - both for statements and reaching conditions
   std::unordered_map<llvm::BasicBlock*, StmtVec> block_stmts;
+  
+  // First, identify all exception handler blocks that should be skipped
+  std::unordered_set<llvm::BasicBlock*> exception_handler_blocks;
+  for (const auto& region : dec_ctx.exception_regions.GetTryRegions()) {
+    if (!region.blocks.empty()) {
+      auto* first_block = *region.blocks.begin();
+      if (first_block->getParent() == &func) {
+        // Skip all catch handler blocks - they'll be processed later
+        for (const auto& handler : region.catch_handlers) {
+          for (auto* handler_block : handler.blocks) {
+            exception_handler_blocks.insert(handler_block);
+            // Mark the block as processed to prevent it from being processed later
+            this->block_stmts[handler_block] = nullptr;
+            LOG(INFO) << "Marking block as exception handler (will skip initial processing): " 
+                      << (handler_block->hasName() ? handler_block->getName().str() : "<unnamed>");
+          }
+        }
+      }
+    }
+  }
+  
   for (auto &block : func) {
+    // Skip exception handler blocks - they'll be processed when building catch bodies
+    if (exception_handler_blocks.count(&block)) {
+      LOG(INFO) << "Skipping exception handler block during initial processing";
+      continue;
+    }
+    
     // Generate statements and track line numbers
     block_stmts[&block] = CreateBasicBlockStmts(&block);
     

@@ -25,6 +25,7 @@
 namespace rellic {
 
 class DecompilationContext;
+struct TryRegion;
 
 class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
  private:
@@ -53,6 +54,9 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   // Line number tracking
   unsigned current_line{1};
   std::unordered_map<std::string, unsigned> bb_line_map;
+  
+  // Cache for basic block statements to prevent duplication
+  std::unordered_map<llvm::BasicBlock*, std::vector<clang::Stmt*>> cached_block_stmts;
 
   // GetOrCreateEdgeForBranch(branch, true) will return the index of an
   // expression that is true when branch is taken.
@@ -68,6 +72,12 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   // be returned.
   unsigned GetOrCreateEdgeForSwitch(llvm::SwitchInst *inst,
                                     llvm::ConstantInt *c);
+  
+  // GetOrCreateEdgeForInvoke(invoke, true) will return the index of an
+  // expression that is true when invoke returns normally.
+  // GetOrCreateEdgeForInvoke(invoke, false) will return the index of an
+  // expression that is true when invoke throws an exception.
+  unsigned GetOrCreateEdgeForInvoke(llvm::InvokeInst *inst, bool normal);
 
   unsigned GetOrCreateEdgeCond(llvm::BasicBlock *from, llvm::BasicBlock *to);
   unsigned GetReachingCond(llvm::BasicBlock *block);
@@ -84,6 +94,7 @@ class GenerateAST : public llvm::AnalysisInfoMixin<GenerateAST> {
   clang::CompoundStmt *StructureAcyclicRegion(llvm::Region *region);
   clang::CompoundStmt *StructureCyclicRegion(llvm::Region *region);
   clang::CompoundStmt *StructureSwitchRegion(llvm::Region *region);
+  clang::CompoundStmt *StructureExceptionRegion(llvm::Region *region, const TryRegion* exc_region);
   clang::CompoundStmt *StructureRegion(llvm::Region *region);
 
   // Process all struct declarations in the module before processing functions

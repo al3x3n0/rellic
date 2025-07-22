@@ -11,9 +11,18 @@
 #include <glog/logging.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/Stmt.h>
+#include <clang/AST/PrettyPrinter.h>
+#include <clang/AST/StmtVisitor.h>
+#include <clang/AST/ASTContext.h>
 
 #include <iostream>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
+#include <sstream>
+#include <regex>
 
 #include "rellic/BC/Util.h"
 #include "rellic/Decompiler.h"
@@ -32,6 +41,8 @@ DEFINE_bool(remove_phi_nodes, false,
 DEFINE_bool(lower_switch, false,
             "Remove SwitchInst by lowering them to branches.");
 DEFINE_bool(output_mapping, false, "Output basic block to line mapping information.");
+DEFINE_bool(enable_exception_try_catch, false,
+            "Transform exception handling patterns into C++ try-catch blocks.");
 
 DECLARE_bool(version);
 
@@ -78,17 +89,46 @@ void WriteMapping(const rellic::DecompilationResult &result, llvm::raw_ostream &
 
   os << "{\n";
   
-  // Write basic block to line mapping
-  os << "  \"bb_to_line\": {\n";
+  // Write basic block information with IR content
+  os << "  \"basic_blocks\": [\n";
   bool first = true;
-  for (const auto &[name, line] : result.bb_to_line_map) {
+  for (const auto &[bb_name, llvm_bb] : result.bb_name_to_llvm_bb) {
     if (!first) {
       os << ",\n";
     }
     first = false;
-    os << "    \"" << EscapeJSON(name) << "\": " << line;
+    
+    // Get the IR content for this basic block
+    std::string ir_content;
+    llvm::raw_string_ostream ir_stream(ir_content);
+    llvm_bb->print(ir_stream);
+    ir_stream.flush();
+    
+    // Get function name
+    std::string func_name = llvm_bb->getParent() ? llvm_bb->getParent()->getName().str() : "unknown";
+    
+    // Format IR content as an array of lines for better readability
+    os << "    {\n"
+       << "      \"name\": \"" << EscapeJSON(bb_name) << "\",\n"
+       << "      \"function\": \"" << EscapeJSON(func_name) << "\",\n"
+       << "      \"ir_content\": [\n";
+    
+    std::istringstream ir_lines(ir_content);
+    std::string line;
+    bool first_line = true;
+    while (std::getline(ir_lines, line)) {
+      if (!first_line) {
+        os << ",\n";
+      }
+      os << "        \"" << EscapeJSON(line) << "\"";
+      first_line = false;
+    }
+    
+    os << "\n      ],\n"
+       << "      \"is_entry\": " << (result.bb_is_entry.count(bb_name) && result.bb_is_entry.at(bb_name) ? "true" : "false") << "\n"
+       << "    }";
   }
-  os << "\n  },\n";
+  os << "\n  ],\n";
 
   // Write expression positions
   os << "  \"expressions\": [\n";
@@ -110,6 +150,22 @@ void WriteMapping(const rellic::DecompilationResult &result, llvm::raw_ostream &
        << "    }";
   }
   os << "\n  ]\n}\n";
+}
+
+// Transform BB marker calls into comments
+std::string TransformBBMarkers(const std::string& line) {
+  // Look for pattern: __builtin_rellic_bb_marker("bb_name");
+  std::regex marker_regex(R"(__builtin_rellic_bb_marker\(\"([^\"]+)\"\);)");
+  std::smatch match;
+  
+  if (std::regex_search(line, match, marker_regex)) {
+    // Extract the BB name
+    std::string bb_name = match[1].str();
+    // Replace the entire line with a comment
+    return "  /* BB: " + bb_name + " */";
+  }
+  
+  return line;
 }
 }  // namespace
 
@@ -184,6 +240,7 @@ int main(int argc, char* argv[]) {
   rellic::DecompilationOptions opts{};
   opts.lower_switches = FLAGS_lower_switch;
   opts.remove_phi_nodes = FLAGS_remove_phi_nodes;
+  opts.enable_exception_try_catch = FLAGS_enable_exception_try_catch;
 
   auto result{rellic::Decompile(std::move(module), std::move(opts))};
   if (result.Succeeded()) {
@@ -197,29 +254,19 @@ int main(int argc, char* argv[]) {
       WriteMapping(value, map_output);
     }
 
-    // First output AST to a string buffer
+    // Print AST to a buffer first
     std::string buffer;
     llvm::raw_string_ostream temp_output(buffer);
     value.ast->getASTContext().getTranslationUnitDecl()->print(temp_output);
     temp_output.flush();
-
-    // Now write to the output file with comments injected
-    std::istringstream input(buffer);
+    
+    // Process output line by line, transforming BB markers
+    std::istringstream reader(buffer);
     std::string line;
-    unsigned current_line = 1;
-
-    while (std::getline(input, line)) {
-      // Check if we need to inject a comment at the end of this line
-      bool has_comment = false;
-      for (const auto &[bb_name, line_num] : value.bb_to_line_map) {
-        if (line_num == current_line) {
-          line += " /* BB: " + bb_name + " */";
-          has_comment = true;
-          break;
-        }
-      }
-      output << line << "\n";
-      current_line++;
+    while (std::getline(reader, line)) {
+      // Transform BB marker calls into comments
+      std::string transformed = TransformBBMarkers(line);
+      output << transformed << "\n";
     }
   } else {
     LOG(FATAL) << result.TakeError().message;
