@@ -147,6 +147,14 @@ def process_bytecode_file(args):
         
         return False, bc_file, "decompile", error_info
 
+def process_task(task):
+    """Process a single task (either decompile or disassemble)"""
+    docker_image, bc_file, output_dir, verbose, operation = task
+    if operation == "decompile":
+        return process_bytecode_file((docker_image, bc_file, output_dir, verbose))
+    else:
+        return disassemble_bytecode_file((docker_image, bc_file, output_dir, verbose))
+
 def main():
     parser = argparse.ArgumentParser(description="Batch process LLVM bytecode files with rellic-decomp and llvm-dis using Docker")
     parser.add_argument("docker_image", help="Docker image containing rellic-decomp")
@@ -236,13 +244,6 @@ def main():
     decompile_failed = []
     disassemble_failed = []
     error_logs = []
-    
-    def process_task(task):
-        docker_image, bc_file, output_dir, verbose, operation = task
-        if operation == "decompile":
-            return process_bytecode_file((docker_image, bc_file, output_dir, verbose))
-        else:
-            return disassemble_bytecode_file((docker_image, bc_file, output_dir, verbose))
     
     with mp.Pool(args.jobs) as pool:
         for success, bc_file, operation, error_info in tqdm(
