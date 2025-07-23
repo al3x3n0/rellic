@@ -437,7 +437,19 @@ StmtVec GenerateAST::CreateBasicBlockStmts(llvm::BasicBlock *block) {
   // Insert a BB marker at the beginning of the block
   // This will appear as a comment in the output
   if (!result.empty()) {
-    auto marker = dec_ctx.ast.CreateCommentMarker(block_name);
+    std::string comment_text = block_name;
+    
+    // Add execution count information if profile data is available
+    if (dec_ctx.profile_data.HasProfileData()) {
+      uint64_t execution_count = dec_ctx.profile_data.GetBlockExecutionCount(block);
+      if (execution_count > 0) {
+        comment_text += " | exec_count: " + std::to_string(execution_count);
+      } else {
+        comment_text += " | exec_count: 0";
+      }
+    }
+    
+    auto marker = dec_ctx.ast.CreateCommentMarker(comment_text);
     result.insert(result.begin(), marker);
   }
 

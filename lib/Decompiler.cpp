@@ -96,6 +96,14 @@ Result<DecompilationResult, DecompilationError> Decompile(
     auto ast_unit{clang::tooling::buildASTFromCodeWithArgs("", args, "out.c")};
     rellic::DecompilationContext dec_ctx(*ast_unit);
 
+    // Load profile data if provided
+    if (!options.profile_data_path.empty()) {
+      LOG(INFO) << "Loading profile data from: " << options.profile_data_path;
+      if (!dec_ctx.profile_data.LoadProfileData(options.profile_data_path)) {
+        LOG(WARNING) << "Failed to load profile data, continuing without execution counts";
+      }
+    }
+
     for (auto& provider : options.additional_providers) {
       dec_ctx.type_provider->AddProvider(provider->create(dec_ctx));
     }

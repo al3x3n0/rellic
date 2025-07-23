@@ -53,6 +53,7 @@ struct DecompilationOptions {
   bool lower_switches = false;
   bool remove_phi_nodes = false;
   bool enable_exception_try_catch = false;  // Transform exception handling patterns to try-catch blocks
+  std::string profile_data_path = "";  // Path to .profdata file for execution count annotations
 
   // Additional type providers to be used during code generation.
   // Providers added later will have higher priority.

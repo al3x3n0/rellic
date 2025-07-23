@@ -43,6 +43,7 @@ DEFINE_bool(lower_switch, false,
 DEFINE_bool(output_mapping, false, "Output basic block to line mapping information.");
 DEFINE_bool(enable_exception_try_catch, false,
             "Transform exception handling patterns into C++ try-catch blocks.");
+DEFINE_string(profile_data, "", "Path to .profdata file for execution count annotations.");
 
 DECLARE_bool(version);
 
@@ -241,6 +242,7 @@ int main(int argc, char* argv[]) {
   opts.lower_switches = FLAGS_lower_switch;
   opts.remove_phi_nodes = FLAGS_remove_phi_nodes;
   opts.enable_exception_try_catch = FLAGS_enable_exception_try_catch;
+  opts.profile_data_path = FLAGS_profile_data;
 
   auto result{rellic::Decompile(std::move(module), std::move(opts))};
   if (result.Succeeded()) {

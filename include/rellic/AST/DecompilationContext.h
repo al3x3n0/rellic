@@ -19,6 +19,7 @@
 #include "rellic/AST/ASTBuilder.h"
 #include "rellic/AST/ExceptionRegionInfo.h"
 #include "rellic/AST/TypeProvider.h"
+#include "rellic/AST/ProfileData.h"
 
 namespace rellic {
 
@@ -91,6 +92,9 @@ struct DecompilationContext {
   std::unordered_map<clang::Stmt*, llvm::Function*> stmt_to_func;
   // Track which BBs belong to which functions
   std::unordered_map<std::string, llvm::Function*> bb_to_func;
+
+  // Profile data for execution counts
+  ProfileData profile_data;
 
   // Current line number during decompilation
   unsigned current_line{1};
