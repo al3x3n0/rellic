@@ -10,6 +10,36 @@ from pathlib import Path
 from tqdm import tqdm
 import json
 from datetime import datetime
+import shutil
+
+# Global variable to store the container runtime
+CONTAINER_RUNTIME = None
+
+def get_container_runtime():
+    """Detect and return the available container runtime (docker or podman)"""
+    global CONTAINER_RUNTIME
+    if CONTAINER_RUNTIME:
+        return CONTAINER_RUNTIME
+    
+    # Check for docker first
+    if shutil.which('docker'):
+        try:
+            subprocess.run(["docker", "--version"], check=True, capture_output=True)
+            CONTAINER_RUNTIME = "docker"
+            return "docker"
+        except subprocess.CalledProcessError:
+            pass
+    
+    # Check for podman
+    if shutil.which('podman'):
+        try:
+            subprocess.run(["podman", "--version"], check=True, capture_output=True)
+            CONTAINER_RUNTIME = "podman"
+            return "podman"
+        except subprocess.CalledProcessError:
+            pass
+    
+    return None
 
 def disassemble_bytecode_file(args):
     """Disassemble a single bytecode file using LLVM's llvm-dis
@@ -17,6 +47,7 @@ def disassemble_bytecode_file(args):
         args: tuple of (llvm_image, bc_file, output_dir, verbose)
     """
     llvm_image, bc_file, output_dir, verbose = args
+    runtime = get_container_runtime()
     bc_path = Path(bc_file).resolve()
     base_name = bc_path.stem
     output_dir = Path(output_dir).resolve()
@@ -26,9 +57,9 @@ def disassemble_bytecode_file(args):
     error_info = {}
 
     try:
-        # Construct Docker command for LLVM disassembly
+        # Construct container command for LLVM disassembly
         cmd = [
-            "docker", "run",
+            runtime, "run",
             "--rm",  # Remove container after execution
             "-v", f"{bc_path.parent}:/input",  # Mount input directory
             "-v", f"{output_dir}:/output",  # Mount output directory
@@ -68,11 +99,12 @@ def disassemble_bytecode_file(args):
         return False, bc_file, "disassemble", error_info
 
 def process_bytecode_file(args):
-    """Process a single bytecode file with rellic-decomp using Docker
+    """Process a single bytecode file with rellic-decomp using Docker/Podman
     Args:
         args: tuple of (docker_image, bc_file, output_dir, verbose)
     """
     docker_image, bc_file, output_dir, verbose = args
+    runtime = get_container_runtime()
     bc_path = Path(bc_file).resolve()
     base_name = bc_path.stem
     output_dir = Path(output_dir).resolve()
@@ -83,9 +115,9 @@ def process_bytecode_file(args):
     error_info = {}
 
     try:
-        # Construct Docker command
+        # Construct container command
         cmd = [
-            "docker", "run",
+            runtime, "run",
             "--rm",  # Remove container after execution
             "-v", f"{bc_path.parent}:/input",  # Mount input directory
             "-v", f"{output_dir}:/output",  # Mount output directory
@@ -156,8 +188,8 @@ def process_task(task):
         return disassemble_bytecode_file((docker_image, bc_file, output_dir, verbose))
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch process LLVM bytecode files with rellic-decomp and llvm-dis using Docker")
-    parser.add_argument("docker_image", help="Docker image containing rellic-decomp")
+    parser = argparse.ArgumentParser(description="Batch process LLVM bytecode files with rellic-decomp and llvm-dis using Docker/Podman")
+    parser.add_argument("docker_image", help="Container image containing rellic-decomp")
     parser.add_argument("input_dir", help="Directory containing .bc files")
     parser.add_argument("--output-dir", "-o", default="decompiled",
                       help="Output directory for decompiled files (default: ./decompiled)")
@@ -168,7 +200,7 @@ def main():
     parser.add_argument("--disassemble", "-d", action="store_true",
                       help="Also disassemble .bc files to .ll using LLVM")
     parser.add_argument("--llvm-image", default="silkeh/clang:16",
-                      help="Docker image containing LLVM tools (default: silkeh/clang:16)")
+                      help="Container image containing LLVM tools (default: silkeh/clang:16)")
     parser.add_argument("--decompile-only", action="store_true",
                       help="Only decompile, skip disassembly even if --disassemble is set")
     parser.add_argument("--disassemble-only", action="store_true",
@@ -177,35 +209,46 @@ def main():
                       help="Output file for error logs (default: batch_decompile_errors.json)")
     args = parser.parse_args()
 
-    # Check if Docker is available
-    try:
-        subprocess.run(["docker", "--version"], check=True, capture_output=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: Docker is not available. Please install Docker and try again.", file=sys.stderr)
+    # Check if Docker or Podman is available
+    runtime = get_container_runtime()
+    if not runtime:
+        print("Error: Neither Docker nor Podman is available.", file=sys.stderr)
+        print("Please install Docker or Podman and try again.", file=sys.stderr)
         sys.exit(1)
+    
+    print(f"Using container runtime: {runtime}")
 
     # Check conflicting options
     if args.decompile_only and args.disassemble_only:
         print("Error: Cannot use both --decompile-only and --disassemble-only", file=sys.stderr)
         sys.exit(1)
     
-    # Check if the Docker images exist
+    # Check if the container images exist
     if not args.disassemble_only:
         try:
-            subprocess.run(["docker", "image", "inspect", args.docker_image], 
-                          check=True, capture_output=True)
+            # Different commands for docker vs podman
+            if runtime == "docker":
+                subprocess.run([runtime, "image", "inspect", args.docker_image], 
+                              check=True, capture_output=True)
+            else:  # podman
+                subprocess.run([runtime, "image", "exists", args.docker_image], 
+                              check=True, capture_output=True)
         except subprocess.CalledProcessError:
-            print(f"Error: Docker image '{args.docker_image}' not found.", file=sys.stderr)
-            print("Please build or pull the image first.", file=sys.stderr)
+            print(f"Error: Container image '{args.docker_image}' not found.", file=sys.stderr)
+            print(f"Please build or pull the image first with: {runtime} pull {args.docker_image}", file=sys.stderr)
             sys.exit(1)
     
     if (args.disassemble or args.disassemble_only) and not args.decompile_only:
         try:
-            subprocess.run(["docker", "image", "inspect", args.llvm_image], 
-                          check=True, capture_output=True)
+            if runtime == "docker":
+                subprocess.run([runtime, "image", "inspect", args.llvm_image], 
+                              check=True, capture_output=True)
+            else:  # podman
+                subprocess.run([runtime, "image", "exists", args.llvm_image], 
+                              check=True, capture_output=True)
         except subprocess.CalledProcessError:
-            print(f"Error: LLVM Docker image '{args.llvm_image}' not found.", file=sys.stderr)
-            print("Please pull the image first with: docker pull {args.llvm_image}", file=sys.stderr)
+            print(f"Error: LLVM container image '{args.llvm_image}' not found.", file=sys.stderr)
+            print(f"Please pull the image first with: {runtime} pull {args.llvm_image}", file=sys.stderr)
             sys.exit(1)
     
     input_dir = Path(args.input_dir)
@@ -245,32 +288,73 @@ def main():
     disassemble_failed = []
     error_logs = []
     
+    # Setup custom progress bar format with dynamic counters
+    bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+    
     with mp.Pool(args.jobs) as pool:
-        for success, bc_file, operation, error_info in tqdm(
+        with tqdm(
             pool.imap_unordered(process_task, all_tasks),
             total=len(all_tasks),
-            desc="Processing files",
-            unit="task"
-        ):
-            if operation == "decompile":
-                if success:
-                    decompile_success += 1
-                else:
-                    decompile_failed.append(bc_file)
-                    if error_info:
-                        error_logs.append(error_info)
-            else:  # disassemble
-                if success:
-                    disassemble_success += 1
-                else:
-                    disassemble_failed.append(bc_file)
-                    if error_info:
-                        error_logs.append(error_info)
+            desc="Starting",
+            unit="task",
+            bar_format=bar_format,
+            dynamic_ncols=True,
+            smoothing=0.1  # Smoother rate calculation
+        ) as progress_bar:
+            for success, bc_file, operation, error_info in progress_bar:
+                if operation == "decompile":
+                    if success:
+                        decompile_success += 1
+                    else:
+                        decompile_failed.append(bc_file)
+                        if error_info:
+                            error_logs.append(error_info)
+                else:  # disassemble
+                    if success:
+                        disassemble_success += 1
+                    else:
+                        disassemble_failed.append(bc_file)
+                        if error_info:
+                            error_logs.append(error_info)
+                
+                # Update progress bar with dynamic counters
+                total_failures = len(decompile_failed) + len(disassemble_failed)
+                total_successes = decompile_success + disassemble_success
+                
+                # Create postfix string with colored counters
+                postfix_parts = []
+                
+                # Color codes for terminals that support ANSI
+                GREEN = "\033[92m"
+                RED = "\033[91m"
+                YELLOW = "\033[93m"
+                RESET = "\033[0m"
+                
+                if not args.disassemble_only:
+                    postfix_parts.append(f"{GREEN}\u2713D:{decompile_success}{RESET}")
+                    if decompile_failed:
+                        postfix_parts.append(f"{RED}\u2717D:{len(decompile_failed)}{RESET}")
+                if (args.disassemble or args.disassemble_only) and not args.decompile_only:
+                    postfix_parts.append(f"{GREEN}\u2713A:{disassemble_success}{RESET}")
+                    if disassemble_failed:
+                        postfix_parts.append(f"{RED}\u2717A:{len(disassemble_failed)}{RESET}")
+                
+                if total_failures > 0:
+                    postfix_parts.append(f"{YELLOW}\u26a0️:{total_failures}{RESET}")
+                
+                # Show current file being processed (truncated if too long)
+                current_file = Path(bc_file).name
+                if len(current_file) > 20:
+                    current_file = current_file[:17] + "..."
+                
+                postfix_str = " | ".join(postfix_parts) if postfix_parts else f"{GREEN}All good{RESET}"
+                progress_bar.set_postfix_str(f"{postfix_str} | {current_file}")
+                progress_bar.set_description(f"Processing {operation}")
 
     # Print summary statistics
-    print(f"\n{'='*60}")
-    print(f"Processing Complete - Summary Statistics")
-    print(f"{'='*60}")
+    print(f"\n\n{'='*70}")
+    print(f"🏁 Processing Complete - Final Statistics")
+    print(f"{'='*70}")
     print(f"Total .bc files found: {len(bc_files)}")
     print(f"Total tasks executed: {len(all_tasks)}")
     print(f"{'='*60}")
