@@ -11,9 +11,13 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 import shutil
+import signal
+import time
 
-# Global variable to store the container runtime
+# Global variables
 CONTAINER_RUNTIME = None
+INTERRUPTED = False
+POOL = None
 
 def get_container_runtime():
     """Detect and return the available container runtime (docker or podman)"""
@@ -41,12 +45,80 @@ def get_container_runtime():
     
     return None
 
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    global INTERRUPTED, POOL
+    if not INTERRUPTED:
+        print(f"\n🛑 Interrupted by user (Ctrl+C). Finishing current tasks...")
+        print("⏳ Please wait while running tasks complete...")
+        INTERRUPTED = True
+        if POOL:
+            POOL.terminate()
+            POOL.join()
+
+def print_final_stats(start_time, decompile_success, disassemble_success, decompile_failed, disassemble_failed, 
+                      bc_files, all_tasks, decompile_times, disassemble_times, interrupted=False):
+    """Print final statistics with timing information"""
+    elapsed_time = time.time() - start_time
+    
+    status_emoji = "🛑" if interrupted else "🏁"
+    status_text = "Interrupted" if interrupted else "Processing Complete"
+    
+    print(f"\n\n{'='*70}")
+    print(f"{status_emoji} {status_text} - Final Statistics")
+    print(f"{'='*70}")
+    print(f"Total runtime: {elapsed_time:.1f} seconds")
+    print(f"Total .bc files found: {len(bc_files)}")
+    print(f"Total tasks executed: {len(all_tasks)}")
+    completed_tasks = decompile_success + disassemble_success + len(decompile_failed) + len(disassemble_failed)
+    print(f"Tasks completed: {completed_tasks}/{len(all_tasks)} ({completed_tasks/len(all_tasks)*100:.1f}%)")
+    
+    # Calculate throughput
+    if completed_tasks > 0:
+        avg_throughput = completed_tasks / elapsed_time
+        print(f"Average throughput: {avg_throughput:.1f} tasks/second")
+    
+    print(f"{'='*60}")
+    
+    if decompile_success + len(decompile_failed) > 0:
+        total_decompile = decompile_success + len(decompile_failed)
+        success_rate = (decompile_success / total_decompile * 100) if total_decompile > 0 else 0
+        print(f"\nDecompilation Results:")
+        print(f"  ✓ Successful: {decompile_success} ({success_rate:.1f}%)")
+        print(f"  ✗ Failed: {len(decompile_failed)} ({100-success_rate:.1f}%)")
+        
+        # Timing statistics for decompilation
+        if decompile_times:
+            avg_time = sum(decompile_times) / len(decompile_times)
+            min_time = min(decompile_times)
+            max_time = max(decompile_times)
+            sorted_times = sorted(decompile_times)
+            median_time = sorted_times[len(sorted_times)//2]
+            print(f"  ⏱️  Timing: avg={avg_time:.1f}s, median={median_time:.1f}s, min={min_time:.1f}s, max={max_time:.1f}s")
+    
+    if disassemble_success + len(disassemble_failed) > 0:
+        total_disassemble = disassemble_success + len(disassemble_failed)
+        success_rate = (disassemble_success / total_disassemble * 100) if total_disassemble > 0 else 0
+        print(f"\nDisassembly Results:")
+        print(f"  ✓ Successful: {disassemble_success} ({success_rate:.1f}%)")
+        print(f"  ✗ Failed: {len(disassemble_failed)} ({100-success_rate:.1f}%)")
+        
+        # Timing statistics for disassembly
+        if disassemble_times:
+            avg_time = sum(disassemble_times) / len(disassemble_times)
+            min_time = min(disassemble_times)
+            max_time = max(disassemble_times)
+            sorted_times = sorted(disassemble_times)
+            median_time = sorted_times[len(sorted_times)//2]
+            print(f"  ⏱️  Timing: avg={avg_time:.1f}s, median={median_time:.1f}s, min={min_time:.1f}s, max={max_time:.1f}s")
+
 def disassemble_bytecode_file(args):
     """Disassemble a single bytecode file using LLVM's llvm-dis
     Args:
         args: tuple of (llvm_image, bc_file, output_dir, verbose)
     """
     llvm_image, bc_file, output_dir, verbose = args
+    task_start_time = time.time()
     runtime = get_container_runtime()
     bc_path = Path(bc_file).resolve()
     base_name = bc_path.stem
@@ -76,7 +148,8 @@ def disassemble_bytecode_file(args):
             check=True
         )
         
-        return True, bc_file, "disassemble", None
+        task_duration = time.time() - task_start_time
+        return True, bc_file, "disassemble", None, task_duration
     except subprocess.CalledProcessError as e:
         error_info = {
             'file': str(bc_file),
@@ -96,14 +169,17 @@ def disassemble_bytecode_file(args):
             print(f"\nError disassembling {bc_file}:", file=sys.stderr)
             print(f"Command: {' '.join(cmd)}", file=sys.stderr)
             print(f"Error output: {e.stderr}", file=sys.stderr)
-        return False, bc_file, "disassemble", error_info
+        
+        task_duration = time.time() - task_start_time
+        return False, bc_file, "disassemble", error_info, task_duration
 
 def process_bytecode_file(args):
     """Process a single bytecode file with rellic-decomp using Docker/Podman
     Args:
-        args: tuple of (docker_image, bc_file, output_dir, verbose)
+        args: tuple of (docker_image, bc_file, output_dir, verbose, profdata_file)
     """
-    docker_image, bc_file, output_dir, verbose = args
+    docker_image, bc_file, output_dir, verbose, profdata_file = args
+    task_start_time = time.time()
     runtime = get_container_runtime()
     bc_path = Path(bc_file).resolve()
     base_name = bc_path.stem
@@ -121,6 +197,14 @@ def process_bytecode_file(args):
             "--rm",  # Remove container after execution
             "-v", f"{bc_path.parent}:/input",  # Mount input directory
             "-v", f"{output_dir}:/output",  # Mount output directory
+        ]
+        
+        # If profdata file is provided, mount its directory and add the argument
+        if profdata_file:
+            profdata_path = Path(profdata_file).resolve()
+            cmd.extend(["-v", f"{profdata_path.parent}:/profdata"])
+        
+        cmd.extend([
             docker_image,
             "rellic-decomp",
             "--input", f"/input/{bc_path.name}",
@@ -128,7 +212,12 @@ def process_bytecode_file(args):
             "--mapping-output", f"/output/{mapping_output.name}",
             "--logtostderr",
             "--minloglevel=0"
-        ]
+        ])
+        
+        # Add profile data argument if provided
+        if profdata_file:
+            profdata_path = Path(profdata_file).resolve()
+            cmd.extend(["--profile_data", f"/profdata/{profdata_path.name}"])
         
         if verbose:
             cmd.extend(["--v=3"])
@@ -144,7 +233,8 @@ def process_bytecode_file(args):
         if not c_output.exists():
             raise FileNotFoundError(f"Expected output {c_output} not created")
         
-        return True, bc_file, "decompile", None
+        task_duration = time.time() - task_start_time
+        return True, bc_file, "decompile", None, task_duration
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         error_info = {
             'file': str(bc_file),
@@ -177,18 +267,23 @@ def process_bytecode_file(args):
                 print(f"Command: {' '.join(cmd)}", file=sys.stderr)
             print(f"Error: {error_info['stderr']}", file=sys.stderr)
         
-        return False, bc_file, "decompile", error_info
+        task_duration = time.time() - task_start_time
+        return False, bc_file, "decompile", error_info, task_duration
 
 def process_task(task):
     """Process a single task (either decompile or disassemble)"""
-    docker_image, bc_file, output_dir, verbose, operation = task
+    docker_image, bc_file, output_dir, verbose, operation, profdata_file = task
     if operation == "decompile":
-        return process_bytecode_file((docker_image, bc_file, output_dir, verbose))
+        return process_bytecode_file((docker_image, bc_file, output_dir, verbose, profdata_file))
     else:
         return disassemble_bytecode_file((docker_image, bc_file, output_dir, verbose))
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch process LLVM bytecode files with rellic-decomp and llvm-dis using Docker/Podman")
+    # Register signal handler for graceful interruption
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    parser = argparse.ArgumentParser(description="Batch process LLVM bytecode files with rellic-decomp and llvm-dis using Docker/Podman. Supports optional profile data for enhanced decompilation with execution counts.")
     parser.add_argument("docker_image", help="Container image containing rellic-decomp")
     parser.add_argument("input_dir", help="Directory containing .bc files")
     parser.add_argument("--output-dir", "-o", default="decompiled",
@@ -207,6 +302,8 @@ def main():
                       help="Only disassemble, skip decompilation")
     parser.add_argument("--error-log", default="batch_decompile_errors.json",
                       help="Output file for error logs (default: batch_decompile_errors.json)")
+    parser.add_argument("--profile-data", "-p", 
+                      help="Optional .profdata file to use for all bytecode files")
     args = parser.parse_args()
 
     # Check if Docker or Podman is available
@@ -222,6 +319,18 @@ def main():
     if args.decompile_only and args.disassemble_only:
         print("Error: Cannot use both --decompile-only and --disassemble-only", file=sys.stderr)
         sys.exit(1)
+    
+    # Validate profile data file if provided
+    profdata_file = None
+    if args.profile_data:
+        profdata_file = Path(args.profile_data)
+        if not profdata_file.exists():
+            print(f"Error: Profile data file '{profdata_file}' not found", file=sys.stderr)
+            sys.exit(1)
+        if not profdata_file.suffix == '.profdata':
+            print(f"Warning: Profile data file '{profdata_file}' does not have .profdata extension", file=sys.stderr)
+        profdata_file = str(profdata_file.resolve())
+        print(f"Using profile data: {profdata_file}")
     
     # Check if the container images exist
     if not args.disassemble_only:
@@ -268,7 +377,8 @@ def main():
     operations = []
     if not args.disassemble_only:
         operations.append(("decompile", args.docker_image))
-        print(f"Decompiling with: {args.docker_image}")
+        profile_info = f" (with profile data)" if profdata_file else ""
+        print(f"Decompiling with: {args.docker_image}{profile_info}")
     if (args.disassemble or args.disassemble_only) and not args.decompile_only:
         operations.append(("disassemble", args.llvm_image))
         print(f"Disassembling with: {args.llvm_image}")
@@ -277,99 +387,100 @@ def main():
     all_tasks = []
     for bc_file in bc_files:
         if not args.disassemble_only:
-            all_tasks.append((args.docker_image, str(bc_file), args.output_dir, args.verbose, "decompile"))
+            all_tasks.append((args.docker_image, str(bc_file), args.output_dir, args.verbose, "decompile", profdata_file))
         if (args.disassemble or args.disassemble_only) and not args.decompile_only:
-            all_tasks.append((args.llvm_image, str(bc_file), args.output_dir, args.verbose, "disassemble"))
+            all_tasks.append((args.llvm_image, str(bc_file), args.output_dir, args.verbose, "disassemble", None))
     
     # Create process pool and process files with progress bar
+    global POOL
     decompile_success = 0
     disassemble_success = 0
     decompile_failed = []
     disassemble_failed = []
+    decompile_times = []
+    disassemble_times = []
     error_logs = []
+    start_time = time.time()
     
     # Setup custom progress bar format with dynamic counters
     bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
     
-    with mp.Pool(args.jobs) as pool:
-        with tqdm(
-            pool.imap_unordered(process_task, all_tasks),
-            total=len(all_tasks),
-            desc="Starting",
-            unit="task",
-            bar_format=bar_format,
-            dynamic_ncols=True,
-            smoothing=0.1  # Smoother rate calculation
-        ) as progress_bar:
-            for success, bc_file, operation, error_info in progress_bar:
-                if operation == "decompile":
-                    if success:
-                        decompile_success += 1
-                    else:
-                        decompile_failed.append(bc_file)
-                        if error_info:
-                            error_logs.append(error_info)
-                else:  # disassemble
-                    if success:
-                        disassemble_success += 1
-                    else:
-                        disassemble_failed.append(bc_file)
-                        if error_info:
-                            error_logs.append(error_info)
-                
-                # Update progress bar with dynamic counters
-                total_failures = len(decompile_failed) + len(disassemble_failed)
-                total_successes = decompile_success + disassemble_success
-                
-                # Create postfix string with colored counters
-                postfix_parts = []
-                
-                # Color codes for terminals that support ANSI
-                GREEN = "\033[92m"
-                RED = "\033[91m"
-                YELLOW = "\033[93m"
-                RESET = "\033[0m"
-                
-                if not args.disassemble_only:
-                    postfix_parts.append(f"{GREEN}\u2713D:{decompile_success}{RESET}")
-                    if decompile_failed:
-                        postfix_parts.append(f"{RED}\u2717D:{len(decompile_failed)}{RESET}")
-                if (args.disassemble or args.disassemble_only) and not args.decompile_only:
-                    postfix_parts.append(f"{GREEN}\u2713A:{disassemble_success}{RESET}")
-                    if disassemble_failed:
-                        postfix_parts.append(f"{RED}\u2717A:{len(disassemble_failed)}{RESET}")
-                
-                if total_failures > 0:
-                    postfix_parts.append(f"{YELLOW}\u26a0️:{total_failures}{RESET}")
-                
-                # Show current file being processed (truncated if too long)
-                current_file = Path(bc_file).name
-                if len(current_file) > 20:
-                    current_file = current_file[:17] + "..."
-                
-                postfix_str = " | ".join(postfix_parts) if postfix_parts else f"{GREEN}All good{RESET}"
-                progress_bar.set_postfix_str(f"{postfix_str} | {current_file}")
-                progress_bar.set_description(f"Processing {operation}")
+    try:
+        with mp.Pool(args.jobs) as pool:
+            POOL = pool
+            with tqdm(
+                pool.imap_unordered(process_task, all_tasks),
+                total=len(all_tasks),
+                desc="Starting",
+                unit="task",
+                bar_format=bar_format,
+                dynamic_ncols=True,
+                smoothing=0.1  # Smoother rate calculation
+            ) as progress_bar:
+                for success, bc_file, operation, error_info, task_duration in progress_bar:
+                    if INTERRUPTED:
+                        break
+                        
+                    if operation == "decompile":
+                        if success:
+                            decompile_success += 1
+                            decompile_times.append(task_duration)
+                        else:
+                            decompile_failed.append(bc_file)
+                            if error_info:
+                                error_logs.append(error_info)
+                    else:  # disassemble
+                        if success:
+                            disassemble_success += 1
+                            disassemble_times.append(task_duration)
+                        else:
+                            disassemble_failed.append(bc_file)
+                            if error_info:
+                                error_logs.append(error_info)
+                    
+                    # Update progress bar with dynamic counters
+                    total_failures = len(decompile_failed) + len(disassemble_failed)
+                    total_successes = decompile_success + disassemble_success
+                    
+                    # Create postfix string with colored counters
+                    postfix_parts = []
+                    
+                    # Color codes for terminals that support ANSI
+                    GREEN = "\033[92m"
+                    RED = "\033[91m"
+                    YELLOW = "\033[93m"
+                    RESET = "\033[0m"
+                    
+                    if not args.disassemble_only:
+                        postfix_parts.append(f"{GREEN}\u2713D:{decompile_success}{RESET}")
+                        if decompile_failed:
+                            postfix_parts.append(f"{RED}\u2717D:{len(decompile_failed)}{RESET}")
+                    if (args.disassemble or args.disassemble_only) and not args.decompile_only:
+                        postfix_parts.append(f"{GREEN}\u2713A:{disassemble_success}{RESET}")
+                        if disassemble_failed:
+                            postfix_parts.append(f"{RED}\u2717A:{len(disassemble_failed)}{RESET}")
+                    
+                    if total_failures > 0:
+                        postfix_parts.append(f"{YELLOW}\u26a0️:{total_failures}{RESET}")
+                    
+                    # Show current file being processed (truncated if too long)
+                    current_file = Path(bc_file).name
+                    if len(current_file) > 20:
+                        current_file = current_file[:17] + "..."
+                    
+                    postfix_str = " | ".join(postfix_parts) if postfix_parts else f"{GREEN}All good{RESET}"
+                    progress_bar.set_postfix_str(f"{postfix_str} | {current_file}")
+                    progress_bar.set_description(f"Processing {operation}")
+    
+    except KeyboardInterrupt:
+        # This shouldn't happen due to signal handler, but just in case
+        pass
+    finally:
+        POOL = None
 
     # Print summary statistics
-    print(f"\n\n{'='*70}")
-    print(f"🏁 Processing Complete - Final Statistics")
-    print(f"{'='*70}")
-    print(f"Total .bc files found: {len(bc_files)}")
-    print(f"Total tasks executed: {len(all_tasks)}")
-    print(f"{'='*60}")
-    
-    if not args.disassemble_only:
-        success_rate = (decompile_success / len(bc_files) * 100) if len(bc_files) > 0 else 0
-        print(f"\nDecompilation Results:")
-        print(f"  ✓ Successful: {decompile_success} ({success_rate:.1f}%)")
-        print(f"  ✗ Failed: {len(decompile_failed)} ({100-success_rate:.1f}%)")
-    
-    if (args.disassemble or args.disassemble_only) and not args.decompile_only:
-        success_rate = (disassemble_success / len(bc_files) * 100) if len(bc_files) > 0 else 0
-        print(f"\nDisassembly Results:")
-        print(f"  ✓ Successful: {disassemble_success} ({success_rate:.1f}%)")
-        print(f"  ✗ Failed: {len(disassemble_failed)} ({100-success_rate:.1f}%)")
+    print_final_stats(start_time, decompile_success, disassemble_success, decompile_failed, disassemble_failed, 
+                      bc_files, all_tasks, decompile_times, disassemble_times, INTERRUPTED)
     
     # Save error logs if there were failures
     if error_logs:
@@ -407,7 +518,13 @@ def main():
     
     # Exit with appropriate code
     total_failures = len(decompile_failed) + len(disassemble_failed)
-    if total_failures > 0:
+    
+    if INTERRUPTED:
+        print(f"\n{'='*60}")
+        print(f"🛑 Processing was interrupted by user")
+        print(f"{'='*60}")
+        sys.exit(130)  # Standard exit code for Ctrl+C
+    elif total_failures > 0:
         print(f"\n{'='*60}")
         print(f"⚠️  {total_failures} total failures detected")
         print(f"{'='*60}")
