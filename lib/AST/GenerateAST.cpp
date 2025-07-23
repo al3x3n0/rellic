@@ -1112,7 +1112,20 @@ void GenerateAST::ProcessStructs(llvm::Module &module) {
   std::vector<llvm::StructType*> sorted_types(struct_types.begin(), struct_types.end());
   std::sort(sorted_types.begin(), sorted_types.end(), 
     [](llvm::StructType* a, llvm::StructType* b) {
-      return a->getName() < b->getName();
+      // Handle literal structs (they don't have names)
+      bool a_has_name = !a->isLiteral() && a->hasName();
+      bool b_has_name = !b->isLiteral() && b->hasName();
+      
+      if (a_has_name && b_has_name) {
+        return a->getName() < b->getName();
+      } else if (a_has_name && !b_has_name) {
+        return true;  // Named structs come before unnamed ones
+      } else if (!a_has_name && b_has_name) {
+        return false; // Unnamed structs come after named ones
+      } else {
+        // Both are unnamed/literal - use pointer comparison for consistent ordering
+        return a < b;
+      }
     });
 
   // Force struct declarations at the start
